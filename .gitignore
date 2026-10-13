@@ -1,0 +1,10 @@
+# 构建产物与缓存
+bin/
+__pycache__/
+*.pyc
+*.o
+*.exe
+*.out
+
+# 实验数据（保留 CSV，忽略中间向量文件）
+bin/vectors_*.txt
