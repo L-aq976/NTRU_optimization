@@ -1,0 +1,15 @@
+# 统一行尾：仓库内一律 LF，避免 Windows / Linux 队友协作时产生"整文件 diff"
+* text=auto eol=lf
+
+# 二进制文件不做任何行尾或文本转换
+*.exe   binary
+*.dll   binary
+*.pdf   binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.xlsx  binary
+*.zip   binary
+
+# 测试向量（由 ntru_cli vectors 生成，体积大且可复现，不入库）
+bin/vectors_*.txt export-ignore
