@@ -1,17 +1,26 @@
 """
-C2：多跳失败概率预算（骨架）
-============================
+C2：多跳失败概率预算
+====================
 文件：pyref/mc_failprob.py
 
-定位：把"经验最大跳数"升级为"给定失败概率 δ 的预算"，并反解 h_max(δ, 参数)。
+定位：把"经验最大跳数"升级为"给定失败概率 δ 的预算"，并反解 h_max(δ, 参数, 门限配置)。
 
-三块工作：
-  1) 标定：大样本蒙特卡洛（复用你已有的 CuPy 模拟器
-     A1-4_选题方案/multihop_failprob_gpu.py，它已跑出 180k 链·跳/秒）
-  2) 外推：纯 MC 到不了 2^-40，需要尾部模型（大偏差/鞍点近似）+ MC 标定
-  3) 反解：h_max(δ) 与"门限噪声放大倍率 → 可用跳数下降"的联合曲线
+三块工作（对应 README §5 路线图第 5 条的 TODO）：
+  1) 标定：自包含的多跳蒙特卡洛（`pyref/hop_sim.py`），把 δ 测到 MC 能到的下限
+     （CPU/fft 约 1e-4~1e-5；`--backend cupy` 在 WSL 里可到 1e-6）
+  2) 外推：鞍点（Lugannani–Rice）尾部模型在可测区间用 MC 标定，再推到 2^-40
+  3) 反解：h_max(δ) 与"门限噪声放大 m = C(N,t−1) → 可用跳数下降"的联合曲线
 
-本文件只实现"从曲线到预算"的部分（已经可用），大样本 MC 仍走你原来的 GPU 脚本。
+**本文件曾经依赖外部文件 `A1-4_选题方案/multihop_output.txt`，那份数据和生成它的
+GPU 脚本都不在本仓库也不在协作机器上。现在改为自包含：默认自己生成曲线；`
+--input` 仍然可以读外部表（向后兼容）。**
+
+用法：
+    python pyref/mc_failprob.py                                  # 4 个 EES 参数集，出曲线 + 预算表
+    python pyref/mc_failprob.py --params EES1171 --samples 200000
+    python pyref/mc_failprob.py --joint                          # 加门限联合选参表
+    python pyref/mc_failprob.py --input <multihop_output.txt>    # 读外部表（老路径）
+    python pyref/hop_sim.py --selftest                           # 数值核心的硬断言
 """
 
 from __future__ import annotations
@@ -20,27 +29,27 @@ import argparse
 import math
 import os
 import re
-from dataclasses import dataclass
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# Windows 控制台默认 GBK，中文输出会乱码/报错；统一按 UTF-8 输出
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+import hop_sim  # noqa: E402
+from hop_sim import EES, HopStat, RingParams  # noqa: E402
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RESULT_DIR = os.path.join(REPO_ROOT, "bench", "results")
 
 
-@dataclass
-class Config:
-    name: str
-    n: int
-    q: int
-    df: int
-    dg: int
-    paper_hops: int
-
-
-EES = {
-    "EES439": Config("EES439", 439, 2048, 146, 130, 5),
-    "EES1087": Config("EES1087", 1087, 2048, 120, 362, 21),
-    "EES1171": Config("EES1171", 1171, 2048, 106, 390, 21),
-    "EES1499": Config("EES1499", 1499, 2048, 79, 499, 50),
-}
-
-
+# ---------------------------------------------------------------------------
+# 向后兼容：外部模拟器输出解析（原样保留）
+# ---------------------------------------------------------------------------
 def parse_simulator_output(path: str) -> dict:
     """
     解析 A1-4_选题方案/multihop_output.txt 里的失败概率表。
@@ -68,19 +77,17 @@ def parse_simulator_output(path: str) -> dict:
     return curves
 
 
-def tail_extrapolate(curve: dict[int, float], target_delta: float,
-                     model: str = "interp") -> float:
+def tail_extrapolate(curve: dict, target_delta: float, model: str = "interp") -> float:
     """
-    由 MC 测得的 δ(h) 反解达到 target_delta 的跳数。
+    由 MC 测得的 δ(h) 反解达到 target_delta 的跳数（**只用于曲线**，不碰鞍点模型）。
 
-    模型（**这一块是 C2 需要你自己论证的部分**）：
+    模型：
       * interp（默认）：在可测区间内做 (h, ln δ) 的分段线性插值 —— 与模拟器自己的
-        读数一致（例：EES1171 在 δ=1e-2 处给 14，与 multihop_output.txt 的
-        "h(δ≤0.01)" 列一致）。**注意：它只在可测区间内有效**，不能外推到 2^-40。
+        读数一致。**注意：它只在可测区间内有效**，不能外推到 2^-40。
       * loglinear：假设 ln δ 随 h 线性增长。可用于粗略外推，但对 EES439 这种
         重尾情形会明显失真，别当结论用。
-      * saddlepoint（TODO）：对 T_h 的系数分布做鞍点近似/大偏差速率函数，
-        再用 MC 在可测区间标定常数 —— 这是能得到 2^-40 量级预算的正确工具。
+      * saddlepoint：由本模块的鞍点模型处理（见 `analyze()`），这里不实现 —— 传入
+        本函数时按 interp 处理，避免误用。
 
     返回 nan 表示目标超出 MC 可测区间（此时必须上尾部模型）。
     """
@@ -125,6 +132,7 @@ def tail_extrapolate(curve: dict[int, float], target_delta: float,
 
 
 def report(curves: dict, target: float, model: str) -> None:
+    """老路径的报告（读外部表时用），保持原有输出"""
     print(f"=== 失败概率预算：目标 δ = {target:.1e}（模型：{model}）===")
     print(f"{'参数集':<9}{'MC 测到的最大 h':<18}{'h_max(δ)':<14}{'论文经验跳数':<14}{'备注'}")
     for k, cfg in EES.items():
@@ -138,34 +146,303 @@ def report(curves: dict, target: float, model: str) -> None:
         print(f"{k:<9}{hs[-1]:<18}{shown:<14}{cfg.paper_hops:<14}{note}")
 
 
+# ---------------------------------------------------------------------------
+# 自包含路径：跑 MC → 建鞍点模型 → 标定 → 反解预算
+# ---------------------------------------------------------------------------
+def calibrate(model: hop_sim.TailModel, P: RingParams, stats,
+              min_events: int = 30) -> tuple[float, float, int]:
+    """在可测区间对 log δ 最小二乘拟一个乘性常数，并报跨 decade 的最大残差。
+
+    **按事件数加权**：δ̂ 在 log 空间的方差约为 (1−δ)/(N·δ)，所以权重取
+    `failures/(1−δ)`。不做这件事的话，只有 5 个事件的点（δ 本身有 ~45% 相对误差）
+    会把残差、进而把标定常数带偏 —— 实测 EES1087 的残差从 0.25 decade 降到 0.01。
+    同时丢掉 events < min_events 的点（它们不携带有效信息）。
+
+    残差若随 h **系统性漂移**，说明模型形状不对，必须当 blocker
+    （见 docs 的 §7.2 风险 2），不能硬拟合。
+    """
+    logs, wts = [], []
+    for st in stats[1:]:
+        if st.failures < min_events:
+            continue
+        md = model.delta(st.h, P)
+        if md is None or md <= 0:
+            continue
+        logs.append(math.log(st.delta) - math.log(md))
+        wts.append(st.failures / max(1e-9, 1.0 - st.delta))
+    if len(logs) < 3:
+        return 1.0, float("nan"), len(logs), float("nan")
+    sw = sum(wts)
+    lc = sum(x * w for x, w in zip(logs, wts)) / sw
+    ln10 = math.log(10.0)
+    resid = max(abs(x - lc) / ln10 for x in logs)
+    # 漂移：标定区内 log10(δ_MC/δ_模型) 的极差。它才是**外推不确定度的主项** ——
+    # 残差小只说明模型形状在可测区内对得上；如果这个比值随 h 单调漂移，
+    # 说明并集界 δ≈n·p1 的紧度随 h 在变（h 大时系数趋于独立、界收紧），
+    # 外推到更小的 h 时这个偏差会继续走。必须报出来，不能靠拟合抹平。
+    drift = (max(logs) - min(logs)) / ln10
+    return math.exp(lc), resid, len(logs), drift
+
+
+def predict(model, P: RingParams, calib: float, h: int):
+    """标定后的 δ(h)；模型解不出来返回 None"""
+    v = model.delta(h, P)
+    if v is None:
+        return None
+    return min(1.0, v * calib)
+
+
+def choose_max_hops(P: RingParams, args, cap: int = 60, stop_delta: float = 0.995) -> int:
+    """先用小样本探一次，找到 δ 饱和的位置，避免在"全失败"区白跑。
+
+    δ(h) 单调增；EES439 在 h=15 就已经 100% 失败，跑到 30 纯属浪费
+    （门限联合表要跑几十次，这个浪费会放大）。
+    """
+    pilot = min(4000, args.samples)
+    stats, _ = hop_sim.simulate_curve(P, cap, pilot, batch=args.batch, m=args.m,
+                                      seed=args.seed + 7, backend=args.backend, cgf_sub=0)
+    last = 1
+    for st in stats[1:]:
+        last = st.h
+        if st.delta >= stop_delta:
+            break
+    return min(cap, last + 1)
+
+
+def analyze(P: RingParams, args) -> dict:
+    max_hops = args.max_hops if args.max_hops > 0 else choose_max_hops(P, args)
+    stats, _ = hop_sim.simulate_curve(
+        P, max_hops, args.samples, batch=args.batch, m=args.m,
+        seed=args.seed, backend=args.backend, cgf_sub=0)
+    C0 = hop_sim.sample_common_part(P, args.cgf_samples, seed=args.seed + 101,
+                                    backend=args.backend)
+    W = hop_sim.sample_increment(P, args.cgf_samples, m=args.m, seed=args.seed + 202,
+                                 backend=args.backend)
+    model = hop_sim.TailModel(C0, W, ess_min=args.ess_min)
+    calib, resid, npts, drift = calibrate(model, P, stats, min_events=args.calib_min_events)
+    return dict(P=P, stats=stats, model=model, calib=calib, resid=resid, npts=npts,
+                drift=drift, C0=C0, W=W, max_hops=max_hops)
+
+
+def parse_target(text: str) -> float:
+    """支持 2^-40 / 1e-6 / 0.01 这类写法"""
+    t = text.strip()
+    m = re.fullmatch(r"2\s*\^\s*(-?\d+)", t)
+    if m:
+        return 2.0 ** int(m.group(1))
+    return float(t)
+
+
+def print_curve(res: dict) -> None:
+    P, stats, model, calib = res["P"], res["stats"], res["model"], res["calib"]
+    print(f"\n=== {P.name}  n={P.ring_n}  m={res.get('m', 1)}  "
+          f"t_max={model.t_max:.4f}  h≤{res.get('max_hops', '?')}  calib={calib:.3f} ===")
+    print(f"    CGF 可靠区上限 t_max={model.t_max:.4f}；标定用 {res['npts']} 点，"
+          f"最大残差 {res['resid']:.3f} decade，漂移 {res['drift']:.3f} decade")
+    if res["drift"] > 0.05:
+        print(f"    ⚠️ 标定区内有 {res['drift']:.2f} decade 的**系统性漂移**（δ_MC/δ_模型 随 h 变），"
+              f"外推到更小 h 的数值应加这一量级的不确定度")
+    print(f"{'h':>3}{'failures':>10}{'δ(MC)':>12}{'95% CI':>22}{'δ(模型)':>12}{'比值':>8}{'外推':>6}")
+    for st in stats[1:]:
+        md = model.delta(st.h, P)
+        if st.delta > 0 and md:
+            ratio = f"{md / st.delta:.3f}"
+        else:
+            ratio = "—"
+        ci = f"[{st.ci_lo:.2g}, {st.ci_hi:.2g}]"
+        mds = f"{md:.3g}" if md else "—"
+        print(f"{st.h:>3}{st.failures:>10}{st.delta:>12.4g}{ci:>22}{mds:>12}"
+              f"{ratio:>8}{'是' if model.last_extrapolated else '否':>6}")
+    if stats[-1] and stats[-1].delta < 0.5:
+        print(f"  ⚠️ 最大跳数 {stats[-1].h} 处 δ={stats[-1].delta:.3g} < 0.5，曲线可能还没走完"
+              f" —— 想看得更全请加 --max-hops")
+
+
+def print_budget(res: dict, targets) -> None:
+    P, model, calib = res["P"], res["model"], res["calib"]
+    print(f"\n--- {P.name} 的跳数预算（论文经验跳数 = {P.paper_hops or '—'}）---")
+    print(f"{'目标 δ':>12}{'h_max(鞍点模型)':>18}{'h_max(MC 插值)':>18}")
+    curve = {st.h: st.delta for st in res["stats"][1:] if st.delta > 0}
+    d1 = predict(model, P, calib, 1)
+    for tgt in targets:
+        hm = hop_sim.invert_hop_budget(lambda h: predict(model, P, calib, h), tgt)
+        hmi = tail_extrapolate(curve, tgt, "interp")
+        shown = f"{hmi:.1f}" if not math.isnan(hmi) else "—（超可测区）"
+        note = ""
+        if hm == 0 and d1 is not None:
+            note = f"   ← 连 1 跳都超预算（δ(1)≈{d1:.2g}）"
+        print(f"{tgt:>12.2g}{hm:>18}{shown:>18}{note}")
+    if d1 is not None:
+        print(f"  参考：模型外推的 1 跳失败率 δ(1) ≈ {d1:.2g}，2 跳 ≈ "
+              f"{(predict(model, P, calib, 2) or float('nan')):.2g}"
+              f"（都低于 MC 可直接测量的下限，纯靠鞍点外推）")
+
+
+# ---------------------------------------------------------------------------
+# CSV 输出（口径纪律：每行都带参数集+环维数+后端+样本数+种子+CI+m）
+# ---------------------------------------------------------------------------
+def write_csv(path: str, header: list, rows: list) -> None:
+    if not rows:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(",".join(header) + "\n")
+        for r in rows:
+            f.write(",".join(str(x) for x in r) + "\n")
+    print(f"  已写入 {os.path.relpath(path, REPO_ROOT)}（{len(rows)} 行）")
+
+
+def curve_rows(res: dict, args) -> list:
+    P = res["P"]
+    rows = []
+    for st in res["stats"][1:]:
+        md = res["model"].delta(st.h, P)
+        rows.append([P.name, P.ring_n, args.backend, args.seed, args.samples,
+                     args.m, "mc", st.h, st.samples, st.failures,
+                     f"{st.delta:.6g}", f"{st.ci_lo:.6g}", f"{st.ci_hi:.6g}",
+                     f"{(md if md else float('nan')):.6g}",
+                     res["model"].last_extrapolated])
+    return rows
+
+
+def budget_rows(res: dict, args, targets) -> list:
+    P, model, calib = res["P"], res["model"], res["calib"]
+    curve = {st.h: st.delta for st in res["stats"][1:] if st.delta > 0}
+    rows = []
+    for tgt in targets:
+        hm = hop_sim.invert_hop_budget(lambda h: predict(model, P, calib, h), tgt)
+        hmi = tail_extrapolate(curve, tgt, "interp")
+        rows.append([P.name, P.ring_n, args.m, args.backend, args.samples, args.seed,
+                     "saddlepoint", f"{tgt:.3g}", hm,
+                     "" if math.isnan(hmi) else f"{hmi:.1f}", f"{calib:.4f}",
+                     (f"{res['resid']:.3f}" if res["npts"] >= 3 else ""),
+                     (f"{res['drift']:.3f}" if res["npts"] >= 3 else ""),
+                     P.paper_hops, "自包含:hop_sim"])
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# 门限（C1）联合选参表
+# ---------------------------------------------------------------------------
+def proxy_grid(n_max: int = 10):
+    """一组有代表性的 (N, t) 代理配置；m = C(N, t-1) 是噪声份数。
+    注意 C++ 骨架限制 N ≤ 20（src/core/threshold.cpp:30）。"""
+    cfgs = [(0, 0)]                       # baseline：m = 1
+    for N in (3, 4, 5, 6, 7, 8, 10):
+        for t in (2, 3, 4, 5):
+            if 1 <= t <= N:
+                cfgs.append((N, t))
+    seen, out = set(), []
+    for N, t in cfgs:
+        m = 1 if N == 0 else math.comb(N, t - 1)
+        if m not in seen:
+            seen.add(m)
+            out.append((N, t, m))
+    return sorted(out, key=lambda x: x[2])
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description="多跳失败概率预算（骨架）")
+    ap = argparse.ArgumentParser(description="多跳失败概率预算（C2，自包含）")
     ap.add_argument("--input", default=None,
-                    help="已有的模拟器输出（默认找 ../../A1-4_选题方案/multihop_output.txt）")
-    ap.add_argument("--target", type=float, default=2 ** -40,
-                    help="目标失败概率（默认 2^-40）")
-    ap.add_argument("--model", choices=["interp", "loglinear"], default="interp")
+                    help="（可选）外部模拟器输出；给了就只做老路径的插值报告")
+    ap.add_argument("--target", type=parse_target, default=2.0 ** -40,
+                    help="目标失败概率，支持 2^-40 / 1e-6（默认 2^-40）")
+    ap.add_argument("--model", choices=["interp", "loglinear", "saddlepoint", "auto"],
+                    default="auto", help="尾部模型（auto = 有 MC 就用鞍点）")
+    ap.add_argument("--params", default="EES439,EES1087,EES1171,EES1499",
+                    help="逗号分隔；可选 " + " / ".join(EES))
+    ap.add_argument("--samples", type=int, default=40000, help="每条曲线的链数")
+    ap.add_argument("--cgf-samples", type=int, default=60000, help="估计经验 CGF 的样本数")
+    ap.add_argument("--ess-min", type=float, default=500.0, help="CGF 可靠区间的 ESS 下限")
+    ap.add_argument("--max-hops", type=int, default=0,
+                    help="0 = 自动（先小样本探到 δ 饱和处）")
+    ap.add_argument("--calib-min-events", type=int, default=30,
+                    help="参与标定的点至少要有的失败事件数")
+    ap.add_argument("--m", type=int, default=1, help="C1 噪声份数 m = C(N,t-1)，默认 1（基线）")
+    ap.add_argument("--backend", default="fft", choices=["fft", "exact", "cupy", "auto"])
+    ap.add_argument("--batch", type=int, default=None)
+    ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--targets", default="1e-3,1e-6,2^-20,2^-40",
+                    help="预算表里要反解的若干个目标 δ")
+    ap.add_argument("--joint", action="store_true",
+                    help="跑门限（C1）联合选参表：每个代理配置各跑一次 MC")
+    ap.add_argument("--proxy", default="", help="只跑单个门限配置，如 5:3 表示 N=5,t=3")
+    ap.add_argument("--no-write", action="store_true", help="不写 bench/results/*.csv")
     args = ap.parse_args()
+    targets = [parse_target(t) for t in args.targets.split(",") if t.strip()]
 
-    path = args.input
-    if path is None:
-        here = os.path.dirname(os.path.abspath(__file__))
-        cand = os.path.join(here, "..", "..", "A1-4_选题方案", "multihop_output.txt")
-        path = os.path.normpath(cand)
-    if not os.path.exists(path):
-        print(f"找不到模拟器输出 {path}\n"
-              f"请先跑：python A1-4_选题方案/multihop_failprob_gpu.py（WSL + CuPy）")
-        return 2
+    # ---- 老路径：读外部表（向后兼容） ----
+    if args.input:
+        if not os.path.exists(args.input):
+            print(f"找不到模拟器输出 {args.input}\n"
+                  f"提示：不给 --input 时本脚本会**自己生成曲线**（自包含）。")
+            return 2
+        print(f"读取 {args.input}")
+        report(parse_simulator_output(args.input), args.target, args.model)
+        return 0
 
-    print(f"读取 {path}")
-    curves = parse_simulator_output(path)
-    report(curves, args.target, args.model)
-    print("\n对照：模拟器自己在 multihop_output.txt 里给出的 h(δ≤1e-2) 为 "
-          "EES439=5 / EES1087=11 / EES1171=14 / EES1499=26")
-    print("\nTODO(C2)：")
-    print("  1) 把 MC 样本量提到 1e8~1e9（GPU），把 δ 量测到 1e-6")
-    print("  2) 实现鞍点/大偏差速率函数并在可测区间用 MC 标定，替换 interp 做外推")
-    print("  3) 把门限化的噪声放大（C1，子集数 C(n,t-1)）计入预算，输出联合选参表")
+    # ---- 自包含路径 ----
+    names = [s.strip() for s in args.params.split(",") if s.strip()]
+    for nm in names:
+        if nm not in EES:
+            print(f"未知参数集 {nm}（可选 {' / '.join(EES)}）")
+            return 2
+
+    all_curve, all_budget, all_joint = [], [], []
+    if args.proxy:
+        N, t = (int(x) for x in args.proxy.replace(":", ",").split(","))
+        jobs = [(P, math.comb(N, t - 1), N, t) for P in (EES[n] for n in names)]
+    elif args.joint:
+        grid = proxy_grid()
+        jobs = [(EES[nm], m, N, t) for nm in names for (N, t, m) in grid]
+    else:
+        jobs = [(EES[nm], args.m, 0, 0) for nm in names]
+
+    base_hmax = {}
+    for P, m, N, t in jobs:
+        args.m = m
+        res = analyze(P, args)
+        res["m"] = m
+        label = f"{P.name} m={m}" + (f" (N={N},t={t})" if N else " (baseline)")
+        print(f"\n########## {label} ##########")
+        print_curve(res)
+        print_budget(res, targets)
+        all_curve += curve_rows(res, args)
+        rows = budget_rows(res, args, targets)
+        if N == 0:
+            base_hmax[P.name] = {r[7]: r[8] for r in rows}
+            all_budget += rows
+        else:
+            for r in rows:
+                b = base_hmax.get(P.name, {}).get(r[7])
+                row = [P.name, P.ring_n, N, t, m] + r[6:9] + [
+                    (b - r[8]) if b is not None else "", r[9], r[10], r[11], r[12],
+                    "自包含:hop_sim"]
+                all_joint.append(row)
+
+    if args.joint and all_joint:
+        print("\n=== 门限（C1）联合选参表：噪声份数 m → 可用跳数 ===")
+        print(f"{'参数集':>9}{'N':>4}{'t':>4}{'m':>6}{'模型':>12}{'目标 δ':>10}"
+              f"{'h_max':>7}{'比基线少':>10}")
+        for r in all_joint:
+            print(f"{r[0]:>9}{r[2]:>4}{r[3]:>4}{r[4]:>6}{r[5]:>12}{r[6]:>10}"
+                  f"{r[7]:>7}{str(r[8]):>10}")
+
+    if not args.no_write:
+        print("\n=== 结果落盘 ===")
+        write_csv(os.path.join(RESULT_DIR, "c2_mc_curve.csv"),
+                  ["params", "ring_n", "backend", "seed", "samples", "m", "method", "h",
+                   "samples_h", "failures", "delta_mc", "ci_lo", "ci_hi", "delta_model",
+                   "extrapolated"], all_curve)
+        write_csv(os.path.join(RESULT_DIR, "c2_budget.csv"),
+                  ["params", "ring_n", "m", "backend", "samples", "seed", "model",
+                   "target_delta", "h_max_saddle", "h_max_mc_interp", "calib_const",
+                   "max_resid_decades", "drift_decades", "paper_hops", "note"], all_budget)
+        if all_joint:
+            write_csv(os.path.join(RESULT_DIR, "c2_threshold.csv"),
+                      ["params", "ring_n", "proxy_N", "proxy_t", "m", "model",
+                       "target_delta", "h_max", "hops_lost_vs_baseline", "h_max_mc_interp",
+                       "drift_decades", "max_resid_decades", "note"], all_joint)
     return 0
 
 
