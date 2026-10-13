@@ -65,14 +65,27 @@ const Params& param_ees1499() {
     return P;
 }
 
+const Params& param_tiny7() {
+    static const Params P = make_ees("TINY7", 7, 2, 2, 2, 1, 1);
+    return P;
+}
+const Params& param_tiny61() {
+    static const Params P = make_ees("TINY61", 61, 10, 10, 10, 5, 5);
+    return P;
+}
+
 const Params& param_by_name(const std::string& name) {
     if (name == "EES439") return param_ees439();
     if (name == "EES1087") return param_ees1087();
     if (name == "EES1171") return param_ees1171();
     if (name == "EES1499") return param_ees1499();
+    if (name == "TINY7") return param_tiny7();
+    if (name == "TINY61") return param_tiny61();
     throw std::invalid_argument("未知参数集: " + name + "（可选 " + list_params() + "）");
 }
 
-std::string list_params() { return "EES439 | EES1087 | EES1171 | EES1499"; }
+std::string list_params() {
+    return "EES439 | EES1087 | EES1171 | EES1499 | TINY7 | TINY61（后两个安全性为零，仅教学/测试）";
+}
 
 }  // namespace ntru

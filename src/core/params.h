@@ -38,6 +38,12 @@ const Params& param_ees1087();
 const Params& param_ees1171();
 const Params& param_ees1499();
 
+// 教学/测试用极小参数（⚠️ 安全性为零）：
+//   TINY7  —— 流程预演用，多项式能整行打印
+//   TINY61 —— 单元测试 + 格攻击复现演示用（格维数 2n = 122，LLL 秒级可处理）
+const Params& param_tiny7();
+const Params& param_tiny61();
+
 // 按名字取参数集；未知名字抛 std::invalid_argument
 const Params& param_by_name(const std::string& name);
 

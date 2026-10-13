@@ -61,14 +61,17 @@ $ python pyref/cross_check.py EES439 7     # C++ 与 Python 参考实现 9 项�
 │   ├── ring_np.py                NumPy 参考：循环卷积 / 中心代表 / 向量解析
 │   ├── ntru_ref_py.py            Python 参考：GF(2) 求逆 + Hensel + 解密
 │   ├── cross_check.py            跨语言一致性校验（9 项代数关系）
+│   ├── attack_lattice.py         ★★ 格攻击：显式构造 Λ_h（2n 维），LLL 恢复私钥
 │   ├── gpu_kernel.py             ★ C3：GPU 批量卷积 + 批量部分重加密（骨架）
 │   └── mc_failprob.py            ★ C2：失败概率预算 / h_max(δ) 外推（骨架）
 └── docs/
     ├── 00_design.md              设计决策与待验证命题（写报告时的底稿）
-    └── 01_加密流程预演.md         ★ 两个对象走一遍完整代码（含手工验算示例）
+    ├── 01_加密流程预演.md         ★ 两个对象走一遍完整代码（含手工验算示例）
+    └── 02_格在哪里.md             ★★ 环 vs 格的关系 + 攻击代码逐段讲解（回答"格在哪"）
 ```
 
-★ 标记的三个文件就是三个创新点的落点：C1 = `threshold.*`，C2 = `mc_failprob.py`，C3 = `gpu_kernel.py`。
+★ 标记的文件是创新点落点：C1 = `threshold.*`，C2 = `mc_failprob.py`，C3 = `gpu_kernel.py`。
+★★ 标记的两个文件回答"**格密码体现在哪**"：算法算环、难度靠格，`attack_lattice.py` 是唯一显式写出格矩阵的地方。
 
 ---
 
@@ -136,14 +139,19 @@ python3 pyref/gpu_kernel.py --backend cupy --n 1171 --batch 8192   # 需要 CuPy
 - [x] **C1 门限**：CNF/子集加性分享、部分重加密、组合；`(n,t)` 覆盖性与 `t-1` 不可组合性有测试
 - [x] 跨语言（C++ ↔ Python）9 项代数关系一致
 - [x] 测试向量导出（`vectors` 子命令）+ 单元测试 + 冒烟 + 微基准
+- [x] **格在哪里的实证**：`pyref/attack_lattice.py` 显式构造 2n 维格 Λ_h + LLL，
+      在 TINY7 上**精确恢复私钥**（0.29 s）；真实参数给出"LLL 差 2^219 倍"的量化说明（见 `docs/02_格在哪里.md`）
 
 ### 下一步（按优先级）
 1. **CSPRNG**：把 `Rng` 换成 `getrandom`/`BCryptGenRandom`（`sampler.h` 里有 TODO）。正式密钥生成**不能**用 `mt19937_64`。
-2. **攻击复现（加分项）**：用 `fpylll` 从 `rk` 恢复 `f_A`，量化"基线 1 个代理即可、门限版需要 t 个代理"。
+2. **rk 攻击（多密钥格）**：`attack_lattice.py` 目前做的是"公钥 h → 私钥 f"；
+   下一步要做"**从 `rk = f_A·f_B^{-1}` 恢复 `f_A`**"（Liu–Pan–Zhang 2019/083 与 2024 版），
+   它是"腐化阈值从 1 提到 t"这个主张的量化依据。WSL 里装 fpylll 后可跑大维数 + BKZ。
 3. **C1 的完整论证**：把 `docs/00_design.md` 里"待验证命题"逐条推完（尤其 partial 的 mod p 泄漏）。
 4. **C3**：把 `poly_mul_i32` 的分块归约搬进 CuPy 核（`gpu_kernel.py` 已给骨架），并用**同分布**重测 CPU/GPU。
 5. **C2**：MC 样本量提到 1e8+，把 `tail_extrapolate` 的 loglinear 换成鞍点/大偏差模型。
-6. 每完成一步，把数字写进 `bench/results/*.csv`（还没建，下一步补）。
+6. **参数安全估计**：用 lattice-estimator / BKZ 成本模型把 `(n,q,df,dg)` 换成安全位数（`docs/02_格在哪里.md` §5）。
+7. 每完成一步，把数字写进 `bench/results/*.csv`（还没建，下一步补）。
 
 ---
 
@@ -155,39 +163,3 @@ python3 pyref/gpu_kernel.py --backend cupy --n 1171 --batch 8192   # 需要 CuPy
 - **`-march=native`**：Windows MinGW 8.1 与 WSL gcc 13.3 都支持，但两者的自动向量化质量不同，性能数字必须注明编译器。
 
 ---
-
-## 7. 多人协作约定（推送权限与分支流程）
-
-### 7.1 谁能推？
-- 本仓库当前是 **public**：任何人都能 **克隆 / 阅读**，但 **push 需要写权限** —— **公开 ≠ 人人可推**。
-- 默认只有仓库所有者（`L-aq976`）能推。队友要推，必须先被加为协作者：
-  `Settings → Collaborators → Add people → 输入对方 GitHub 用户名 → 权限选 Write → 对方接受邀请`。
-- 不想给权限的场景（外部帮忙、临时贡献）：让对方 **Fork → 改 → 发 Pull Request**，你 review 后合并。
-- `main` 分支目前 **没有保护规则**：有写权限的人可以直推 main；若想强制走 PR，去 `Settings → Branches → Add branch protection rule`。
-- ⚠️ **赛前保密**：仓库是 public，任何人都能复制。若不想在提交前公开，去 `Settings → General → Danger Zone → Change visibility → Make private`（私有后协作者照样可推）。
-
-### 7.2 分支约定（3~4 人小团队够用）
-| 场景 | 做法 |
-|---|---|
-| 改自己负责的模块、小改动 | `git pull --rebase` 后直接推 `main` |
-| 会动到别人文件 / 大重构 / 实验性改动 | 开分支：`feat/xxx`、`perf/xxx`（如 `perf/gpu-batch-reenc`），完成即开 PR |
-| **千万别做** | `git push --force` 到 `main`；把 `bin/`、exe、大文件提交进去；改了别人模块不吭声 |
-
-### 7.3 开工前 / 收工前
-```bash
-git pull --rebase                     # 开工前先同步，避免冲突堆积
-# ... 改代码 ...
-git add -A && git commit -m "说明这次改了什么"
-git push                              # 收工前推上去
-```
-
-### 7.4 目录归属建议（避免撞车）
-| 目录 / 文件 | 建议负责人 | 注意事项 |
-|---|---|---|
-| `src/core/` | 主实现（1 人） | 核心算法，任何改动都要跑通 `selftest` + `bin/ntru_tests` |
-| `pyref/gpu_kernel.py` | GPU 方向（1 人） | 在 WSL 里跑；不要把编出来的 exe / 中间数据提交进来 |
-| `pyref/mc_failprob.py` | 模拟/预算方向（1 人） | 输入是 `A1-4_选题方案/multihop_output.txt`（另一个目录，不在本仓库） |
-| `docs/`、`README.md` | 报告方向（1 人） | 同一节不要两人同时改；改完记得同步数字与实测结果 |
-
-### 7.5 行尾与文件类型
-仓库根目录有 `.gitattributes`：**所有文本文件统一 LF**，二进制（exe/pdf/png/xlsx）不做转换。Windows 队友请保持 `git config core.autocrlf false`（本仓库已设为 false），否则会产生整文件 diff。
