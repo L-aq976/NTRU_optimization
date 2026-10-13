@@ -190,6 +190,28 @@ def sample_fB(rng, xp, B: int, n: int, P: RingParams):
     return f
 
 
+def sample_message(rng, xp, B: int, n: int, P: RingParams):
+    """明文，**mod p 表示 {0,1,...,p−1}**，与 C++ 的 `sample_message` 逐位一致。
+
+    ⚠️ 这里必须用 mod p 表示而不是中心表示 {−1,0,1}，两者在环里等价（差 3·k，
+    k 是"−1 处"的指示），但**在 Z 上不等价**：噪声核里 F_A·M 那一项会差
+    3·F_A·k。C++ 的实现走的是 `mod_q(t[i], p)`，即 −1 → p−1。
+
+    实测（用 bin/vectors_EES439_7.txt 的真实 T_1）：
+        M_raw 表示  ⇒ T_1 的 std = 42.6，与真实值逐位相等 ✅
+        M_cent 表示 ⇒ T_1 的 std = 40.0，与真实值不符 ❌
+    差别只有 ~6%（因为 M_cent 与 k 互补、两者强反相关），但在指数敏感的尾部
+    6% 的噪声尺度差约等于 60 倍的 δ 差 —— 必须按参考实现来。
+    """
+    return sample_fixed_weight(rng, xp, B, n, P.dm0, P.dm1) % P.p
+
+
+def message_center(M, P: RingParams, xp):
+    """mod p 表示 -> 中心表示 {-(p/2), ..., p/2}（对应 C++ 的 message_to_center）"""
+    c = M % P.p
+    return xp.where(c > P.p // 2, c - P.p, c)
+
+
 def sample_sum_fixed_weight(rng, xp, B: int, n: int, plus: int, minus: int, m: int):
     """C1 门限噪声：Σ_{k=1..m} e_k（m 份独立同分布的固定重量三元多项式）"""
     E = sample_fixed_weight(rng, xp, B, n, plus, minus)
@@ -198,17 +220,20 @@ def sample_sum_fixed_weight(rng, xp, B: int, n: int, plus: int, minus: int, m: i
     return E
 
 
-def chain_failure_mask(T, M, P: RingParams, xp) -> np.ndarray:
+def chain_failure_mask(T, M_raw, P: RingParams, xp) -> np.ndarray:
     """逐位复现 C++ 的 decrypt_with_noise + poly_mod_p_centered 判据。
+
+    `M_raw` 是 mod p 表示的明文（{0,..,p−1}），解出来之后要与它**的中心表示**比
+    （C++ 里是 `message_equal(P, m, decrypt(f, c))`）。
 
     返回 (B,) 布尔数组：True 表示该链解密失败。
     """
-    v = P.p * T + M                       # == f_Bh·C_Bh，此时还没 mod q
+    v = P.p * T + M_raw                      # == f_Bh·C_Bh，此时还没 mod q
     c = v % P.q
     c = xp.where(c > P.q // 2, c - P.q, c)   # 中心代表 (-q/2, q/2]
     d = c % P.p
     d = xp.where(d > P.p // 2, d - P.p, d)   # -> {-1,0,1}
-    return xp.any(d != M, axis=1)
+    return xp.any(d != message_center(M_raw, P, xp), axis=1)
 
 
 def wilson_ci(k: int, N: int, z: float = 1.96) -> tuple[float, float]:
@@ -262,7 +287,7 @@ def simulate_curve(P: RingParams, max_hops: int, samples: int,
         g = sample_fixed_weight(rng, xp, b, n, P.dg, P.dg)
         s = sample_fixed_weight(rng, xp, b, n, P.dr, P.dr)
         FA = sample_fixed_weight(rng, xp, b, n, P.df, P.df)
-        M = sample_fixed_weight(rng, xp, b, n, P.dm0, P.dm1)
+        M = sample_message(rng, xp, b, n, P)
         T = be.conv(g, s) + be.conv(FA, M)          # h 无关的公共部分
 
         for h in range(1, max_hops + 1):
@@ -291,13 +316,23 @@ def simulate_curve(P: RingParams, max_hops: int, samples: int,
     return stats, out
 
 
+def auto_chunk(n: int) -> int:
+    """按"一个 (chunk,n) 数组 + 补零后 FFT 的临时量"估的批大小，控制进程池的内存峰值"""
+    return int(max(1024, min(8192, 2_000_000 // max(1, n))))
+
+
 def sample_common_part(P: RingParams, N: int, seed: int = 2, backend: str = "fft",
-                       chunk: int = 8192) -> np.ndarray:
-    """C0 = (g·s + F_A·M) 单个系数的样本（供鞍点公式里对偏移量做分位数求积）"""
+                       chunk: int | None = None) -> np.ndarray:
+    """C0 = (g·s + F_A·M) 单个系数的样本。
+
+    只依赖参数集（不依赖 m），所以调用方应当**每个参数集只算一次**再复用。
+    """
     be = get_backend(backend)
     xp = be.xp
     rng = xp.random.default_rng(seed)
     n = P.ring_n
+    if chunk is None:
+        chunk = auto_chunk(n)
     outs = []
     done = 0
     while done < N:
@@ -305,7 +340,7 @@ def sample_common_part(P: RingParams, N: int, seed: int = 2, backend: str = "fft
         g = sample_fixed_weight(rng, xp, b, n, P.dg, P.dg)
         s = sample_fixed_weight(rng, xp, b, n, P.dr, P.dr)
         FA = sample_fixed_weight(rng, xp, b, n, P.df, P.df)
-        M = sample_fixed_weight(rng, xp, b, n, P.dm0, P.dm1)
+        M = sample_message(rng, xp, b, n, P)
         T0 = be.conv(g, s) + be.conv(FA, M)
         cols = rng.integers(0, n, size=b)          # 每条链取一个系数
         rows = xp.arange(b)
@@ -319,7 +354,7 @@ def sample_common_part(P: RingParams, N: int, seed: int = 2, backend: str = "fft
 # 经验 CGF + 鞍点（Lugannani–Rice）
 # ---------------------------------------------------------------------------
 def sample_increment(P: RingParams, N: int, m: int = 1, seed: int = 3,
-                     backend: str = "fft", chunk: int = 8192) -> np.ndarray:
+                     backend: str = "fft", chunk: int | None = None) -> np.ndarray:
     """单跳增量 W = (Σ_{k=1..m} e_k)·f_B 的**单个系数**样本（每条链取一个系数）。
 
     T_h = C0 + Σ_{i=1..h} W_i，且 W_i 相互独立、与 C0 独立 —— 于是
@@ -329,6 +364,8 @@ def sample_increment(P: RingParams, N: int, m: int = 1, seed: int = 3,
     xp = be.xp
     rng = xp.random.default_rng(seed)
     n = P.ring_n
+    if chunk is None:
+        chunk = auto_chunk(n)
     outs = []
     done = 0
     while done < N:
@@ -609,6 +646,17 @@ def _selftest() -> int:
               f"Var(g·s 系数) 对得上理论 4·dg·dr/n（{nm}：{z.var():.1f} vs {theo:.1f}）")
         sk = float(((z - z.mean()) ** 3).mean() / (z.std() ** 3 + 1e-12))
         check(abs(sk) < 0.15, f"g·s 系数近似对称（{nm} 偏度 {sk:+.3f}）")
+
+    # 断言：明文用 mod p 表示 {0,..,p−1}（−1 变成 p−1），与 C++ 的 sample_message 一致。
+    # 这条很关键：换成中心表示会让噪声核里的 F_A·M 项不同（见 sample_message 的注释）。
+    rr = np.random.default_rng(31337)
+    P0 = EES["EES439"]
+    Mm = sample_message(rr, np, 2000, P0.ring_n, P0)
+    check(bool(np.isin(np.unique(Mm), np.arange(P0.p)).all()),
+          f"明文系数落在 [0, p) = [0, {P0.p})")
+    check(bool(np.all((Mm == 1).sum(axis=1) == P0.dm0))
+          and bool(np.all((Mm == P0.p - 1).sum(axis=1) == P0.dm1)),
+          f"明文有 dm0={P0.dm0} 个 1、dm1={P0.dm1} 个 {P0.p - 1}（= 中心表示的 −1）")
 
     # 断言：单跳增量 W = e·f_B 的系数分布对称 —— 鞍点里 p1 = 2·P(T_h > τ) 靠的就是这条。
     # (e→−e 保持分布 ⇒ e·f_B 与它的反号等分布；EES 参数集另有 dm0 == dm1。)

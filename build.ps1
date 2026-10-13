@@ -27,7 +27,15 @@ if (-not (Get-Command g++ -ErrorAction SilentlyContinue)) {
     throw "g++ not found in PATH (install MinGW-w64 or build inside WSL)"
 }
 
-$flags = @("-O3", "-std=c++17", "-march=native", "-fopenmp", "-Wall", "-Wextra", "-I$src")
+# -static-libstdc++ / -static-libgcc is NOT optional on Windows:
+#   Git for Windows ships its own (older) libstdc++-6.dll and puts it on PATH
+#   ahead of the MinGW toolchain's. If we link dynamically, the exe binds to
+#   THAT dll and mixing runtimes corrupts C++ objects -> access violation.
+#   Symptom seen in practice: `ntru_cli vectors` segfaults while `selftest`
+#   survives, because vectors is the only subcommand that constructs an
+#   ofstream (the crash is inside basic_ofstream's constructor).
+$flags = @("-O3", "-std=c++17", "-march=native", "-fopenmp", "-Wall", "-Wextra",
+           "-static-libstdc++", "-static-libgcc", "-I$src")
 $core  = Get-ChildItem (Join-Path $src "core") -Filter *.cpp | ForEach-Object { $_.FullName }
 $cliOut  = Join-Path $bin "ntru_cli.exe"
 $testOut = Join-Path $bin "ntru_tests.exe"
