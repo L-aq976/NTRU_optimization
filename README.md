@@ -61,14 +61,17 @@ $ python pyref/cross_check.py EES439 7     # C++ 与 Python 参考实现 9 项�
 │   ├── ring_np.py                NumPy 参考：循环卷积 / 中心代表 / 向量解析
 │   ├── ntru_ref_py.py            Python 参考：GF(2) 求逆 + Hensel + 解密
 │   ├── cross_check.py            跨语言一致性校验（9 项代数关系）
+│   ├── attack_lattice.py         ★★ 格攻击：显式构造 Λ_h（2n 维），LLL 恢复私钥
 │   ├── gpu_kernel.py             ★ C3：GPU 批量卷积 + 批量部分重加密（骨架）
 │   └── mc_failprob.py            ★ C2：失败概率预算 / h_max(δ) 外推（骨架）
 └── docs/
     ├── 00_design.md              设计决策与待验证命题（写报告时的底稿）
-    └── 01_加密流程预演.md         ★ 两个对象走一遍完整代码（含手工验算示例）
+    ├── 01_加密流程预演.md         ★ 两个对象走一遍完整代码（含手工验算示例）
+    └── 02_格在哪里.md             ★★ 环 vs 格的关系 + 攻击代码逐段讲解（回答"格在哪"）
 ```
 
-★ 标记的三个文件就是三个创新点的落点：C1 = `threshold.*`，C2 = `mc_failprob.py`，C3 = `gpu_kernel.py`。
+★ 标记的文件是创新点落点：C1 = `threshold.*`，C2 = `mc_failprob.py`，C3 = `gpu_kernel.py`。
+★★ 标记的两个文件回答"**格密码体现在哪**"：算法算环、难度靠格，`attack_lattice.py` 是唯一显式写出格矩阵的地方。
 
 ---
 
@@ -136,14 +139,19 @@ python3 pyref/gpu_kernel.py --backend cupy --n 1171 --batch 8192   # 需要 CuPy
 - [x] **C1 门限**：CNF/子集加性分享、部分重加密、组合；`(n,t)` 覆盖性与 `t-1` 不可组合性有测试
 - [x] 跨语言（C++ ↔ Python）9 项代数关系一致
 - [x] 测试向量导出（`vectors` 子命令）+ 单元测试 + 冒烟 + 微基准
+- [x] **格在哪里的实证**：`pyref/attack_lattice.py` 显式构造 2n 维格 Λ_h + LLL，
+      在 TINY7 上**精确恢复私钥**（0.29 s）；真实参数给出"LLL 差 2^219 倍"的量化说明（见 `docs/02_格在哪里.md`）
 
 ### 下一步（按优先级）
 1. **CSPRNG**：把 `Rng` 换成 `getrandom`/`BCryptGenRandom`（`sampler.h` 里有 TODO）。正式密钥生成**不能**用 `mt19937_64`。
-2. **攻击复现（加分项）**：用 `fpylll` 从 `rk` 恢复 `f_A`，量化"基线 1 个代理即可、门限版需要 t 个代理"。
+2. **rk 攻击（多密钥格）**：`attack_lattice.py` 目前做的是"公钥 h → 私钥 f"；
+   下一步要做"**从 `rk = f_A·f_B^{-1}` 恢复 `f_A`**"（Liu–Pan–Zhang 2019/083 与 2024 版），
+   它是"腐化阈值从 1 提到 t"这个主张的量化依据。WSL 里装 fpylll 后可跑大维数 + BKZ。
 3. **C1 的完整论证**：把 `docs/00_design.md` 里"待验证命题"逐条推完（尤其 partial 的 mod p 泄漏）。
 4. **C3**：把 `poly_mul_i32` 的分块归约搬进 CuPy 核（`gpu_kernel.py` 已给骨架），并用**同分布**重测 CPU/GPU。
 5. **C2**：MC 样本量提到 1e8+，把 `tail_extrapolate` 的 loglinear 换成鞍点/大偏差模型。
-6. 每完成一步，把数字写进 `bench/results/*.csv`（还没建，下一步补）。
+6. **参数安全估计**：用 lattice-estimator / BKZ 成本模型把 `(n,q,df,dg)` 换成安全位数（`docs/02_格在哪里.md` §5）。
+7. 每完成一步，把数字写进 `bench/results/*.csv`（还没建，下一步补）。
 
 ---
 
