@@ -15,7 +15,7 @@ $ bin/ntru_cli.exe selftest      # 21 项全部通过
 $ bin/ntru_cli.exe walkthrough   # ★ 教学参数(n=7)下的完整流程预演，每一步都打印全部系数
 $ bin/ntru_cli.exe smoke EES439 3 2
    KeyGen 1.18ms / Enc 0.11ms / Dec 0.10ms / ReKeyGen 0.10ms / ReEnc 0.23ms
-   门限 (n=3,t=2): 子集数 3, 耗时 0.76ms, 噪声 640（相对基线 ×1.53）
+   门限 (n=3,t=2): 子集数 3, 噪声 698（相对基线 ×1.40）
 $ python pyref/cross_check.py EES439 7     # C++ 与 Python 参考实现 9 项代数关系全部一致
 ```
 
@@ -57,6 +57,7 @@ $ python pyref/cross_check.py EES439 7     # C++ 与 Python 参考实现 9 项�
 │   └── tests/                    （见 tests/test_core.cpp，独立的单元测试）
 ├── tests/
 │   ├── test_core.cpp             单元测试（独立于 CLI）
+│   └── fixtures/                 C2 硬断言用的测试向量（bin/ 被 gitignore，所以固化在这里）
 ├── pyref/
 │   ├── ring_np.py                NumPy 参考：循环卷积 / 中心代表 / 向量解析
 │   ├── ntru_ref_py.py            Python 参考：GF(2) 求逆 + Hensel + 解密

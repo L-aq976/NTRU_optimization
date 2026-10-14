@@ -61,7 +61,10 @@ class RingParams:
 
 
 EES: dict[str, RingParams] = {
-    "EES439":  RingParams("EES439",  439, 2048, 3, 146, 130, 126, 128, 128, paper_hops=5),
+    # EES439 实为 ntru 的 APR2011_439（EES 族没有 439）：df=146, dg=N/3=146, dr=df=146,
+    # dm0=130, dm1=maxM1=126。旧值 (130,126,128,128) 是把 ntru 的 (df,dm0,maxM1,db)
+    # 误读成 (df,dg,dr,dm0) 得来的，见 docs/C2_实现进度.md §4.5(b)。
+    "EES439":  RingParams("EES439",  439, 2048, 3, 146, 146, 146, 130, 126, paper_hops=5),
     "EES1087": RingParams("EES1087", 1087, 2048, 3, 120, 362, 120, 120, 120, paper_hops=21),
     "EES1171": RingParams("EES1171", 1171, 2048, 3, 106, 390, 106, 106, 106, paper_hops=21),
     "EES1499": RingParams("EES1499", 1499, 2048, 3, 79, 499, 79, 79, 79, paper_hops=50),
@@ -668,10 +671,14 @@ def _selftest() -> int:
         check(abs(sk) < 0.05, f"单跳增量 W 的系数对称（{nm} 偏度 {sk:+.4f}）")
         check(abs(w.mean()) < 0.05 * w.std(), f"W 零均值（{nm} 均值/σ={w.mean() / w.std():+.4f}）")
 
-    # 断言 2：exact 后端 vs C++ 导出的测试向量（若文件存在）
+    # 断言 2：exact 后端 vs C++ 导出的测试向量
+    # 优先用仓库里固化的 fixture（bin/ 是 gitignore 的，新克隆的仓库里不会有）
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    vec = os.path.join(root, "bin", "vectors_EES439_7.txt")
-    if os.path.exists(vec):
+    vec = next((p for p in (
+        os.path.join(root, "tests", "fixtures", "vectors_EES439_7.txt"),
+        os.path.join(root, "bin", "vectors_EES439_7.txt"),
+    ) if os.path.exists(p)), None)
+    if vec is not None:
         v = parse_vectors(vec)
         q, p = v["Q"], v["P"]
         FB_v, CB_v, M_v = v["FB"], v["CB"], v["M"]
@@ -698,7 +705,10 @@ def _selftest() -> int:
         check(np.array_equal(lhs, T1),
               "T_1 == g·s + F_A·M + e·f_B（用 C++ 导出的 vectors 独立复核噪声核公式）")
     else:
-        print(f"  [skip] 找不到 {vec}，跳过 C++ 向量对拍")
+        print("  [SKIP] ⚠️ 找不到 tests/fixtures/vectors_EES439_7.txt，"
+              "**跳过了与 C++ 引擎逐位对拍的那条断言**")
+        print("         这条断言是发现明文表示 bug 的工具，不是可有可无的。"
+              "重新生成见 README §6（需先加 -static-libstdc++ 重建 ntru_cli）")
 
     print(f"=== 自检：{'全部通过' if bad == 0 else f'{bad} 项失败'} ===")
     return 1 if bad else 0
