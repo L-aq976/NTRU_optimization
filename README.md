@@ -63,14 +63,19 @@ $ python pyref/cross_check.py EES439 7     # C++ 与 Python 参考实现 9 项�
 │   ├── cross_check.py            跨语言一致性校验（9 项代数关系）
 │   ├── attack_lattice.py         ★★ 格攻击：显式构造 Λ_h（2n 维），LLL 恢复私钥
 │   ├── gpu_kernel.py             ★ C3：GPU 批量卷积 + 批量部分重加密（骨架）
-│   └── mc_failprob.py            ★ C2：失败概率预算 / h_max(δ) 外推（骨架）
+│   ├── hop_sim.py                ★ C2 数值核心：多跳蒙特卡洛 + 鞍点（Lugannani–Rice）尾部模型
+│   └── mc_failprob.py            ★ C2：失败概率预算 / h_max(δ) 反解（已自包含）
+├── bench/
+│   └── results/                  C2 实测数字：c2_mc_curve.csv / c2_budget.csv / c2_threshold.csv
 └── docs/
     ├── 00_design.md              设计决策与待验证命题（写报告时的底稿）
     ├── 01_加密流程预演.md         ★ 两个对象走一遍完整代码（含手工验算示例）
-    └── 02_格在哪里.md             ★★ 环 vs 格的关系 + 攻击代码逐段讲解（回答"格在哪"）
+    ├── 02_格在哪里.md             ★★ 环 vs 格的关系 + 攻击代码逐段讲解（回答"格在哪"）
+    ├── C2失败概率预算_实施计划.md  C2 的噪声模型、鞍点方案与验证计划
+    └── C2_实现进度.md             C2 进度：改动原因、验证证据、已跑出的数字
 ```
 
-★ 标记的文件是创新点落点：C1 = `threshold.*`，C2 = `mc_failprob.py`，C3 = `gpu_kernel.py`。
+★ 标记的文件是创新点落点：C1 = `threshold.*`，C2 = `hop_sim.py` + `mc_failprob.py`，C3 = `gpu_kernel.py`。
 ★★ 标记的两个文件回答"**格密码体现在哪**"：算法算环、难度靠格，`attack_lattice.py` 是唯一显式写出格矩阵的地方。
 
 ---
@@ -141,6 +146,9 @@ python3 pyref/gpu_kernel.py --backend cupy --n 1171 --batch 8192   # 需要 CuPy
 - [x] 测试向量导出（`vectors` 子命令）+ 单元测试 + 冒烟 + 微基准
 - [x] **格在哪里的实证**：`pyref/attack_lattice.py` 显式构造 2n 维格 Λ_h + LLL，
       在 TINY7 上**精确恢复私钥**（0.29 s）；真实参数给出"LLL 差 2^219 倍"的量化说明（见 `docs/02_格在哪里.md`）
+- [x] **C2 失败概率预算**：`pyref/hop_sim.py` + `pyref/mc_failprob.py` 自包含跑出 δ(h) 曲线，
+      用鞍点模型外推到 `2^-40` 并反解 `h_max(δ, 参数, 门限配置)`。
+      噪声核公式已用 C++ 引擎导出的 `bin/vectors_EES439_7.txt` **逐位对拍**（见 `docs/C2_实现进度.md`）
 
 ### 下一步（按优先级）
 1. **CSPRNG**：把 `Rng` 换成 `getrandom`/`BCryptGenRandom`（`sampler.h` 里有 TODO）。正式密钥生成**不能**用 `mt19937_64`。
@@ -149,9 +157,11 @@ python3 pyref/gpu_kernel.py --backend cupy --n 1171 --batch 8192   # 需要 CuPy
    它是"腐化阈值从 1 提到 t"这个主张的量化依据。WSL 里装 fpylll 后可跑大维数 + BKZ。
 3. **C1 的完整论证**：把 `docs/00_design.md` 里"待验证命题"逐条推完（尤其 partial 的 mod p 泄漏）。
 4. **C3**：把 `poly_mul_i32` 的分块归约搬进 CuPy 核（`gpu_kernel.py` 已给骨架），并用**同分布**重测 CPU/GPU。
-5. **C2**：MC 样本量提到 1e8+，把 `tail_extrapolate` 的 loglinear 换成鞍点/大偏差模型。
+5. **C2 收尾**：① 查清 `docs/C2_实现进度.md` §4.4 记的 **EES1087 与论文 Table 4 不一致**
+   （我们算出 δ(21)=56.7%，设计文档认为应约 10%；其余三个参数集都对上了）；
+   ② 门限联合表（`--m-list`）跑全；③ `--backend cupy` 在 WSL 里实测，把 MC 样本量提到 1e7+ 让 δ 测到 1e-6。
 6. **参数安全估计**：用 lattice-estimator / BKZ 成本模型把 `(n,q,df,dg)` 换成安全位数（`docs/02_格在哪里.md` §5）。
-7. 每完成一步，把数字写进 `bench/results/*.csv`（还没建，下一步补）。
+7. 每完成一步，把数字写进 `bench/results/*.csv`（**已建**：C2 的三张表在那里）。
 
 ---
 
@@ -161,5 +171,12 @@ python3 pyref/gpu_kernel.py --backend cupy --n 1171 --batch 8192   # 需要 CuPy
 - **q = 2048 不能做 NTT**：`(Z/2048)^×` 阶为 1024 < n，不存在 n 阶单位根；要 NTT 必须走 CRT + NTT 友好素数。
 - **WSL2 内存约 7.6 GB**：编译/跑大实验时注意内存；GPU 侧 H2D 只有 0.8–2.1 GB/s（端到端吞吐要单独报）。
 - **`-march=native`**：Windows MinGW 8.1 与 WSL gcc 13.3 都支持，但两者的自动向量化质量不同，性能数字必须注明编译器。
+- **⚠️ Windows 上必须加 `-static-libstdc++ -static-libgcc`**（`build.ps1` 已加）。
+  Git for Windows 自带一份**较旧的** `libstdc++-6.dll` 并把它排在 PATH 前面，动态链接的 exe 运行时会绑到**那一份**，
+  与编译时用的 `D:/mingw64`（g++ 16.2）头文件 ABI 不一致 → 访问违例。
+  **症状很有迷惑性**：`selftest` / `smoke` / `bench` 全都正常，**只有 `vectors` 段错误** ——
+  因为它是唯一构造 `std::ofstream` 的子命令，崩的位置在 `basic_ofstream` 构造函数里，看起来像源码 bug。
+  排查：`g++ -g -O2 ... && gdb -batch -ex run -ex bt --args ...`；栈里会看到
+  `libstdc++-6.dll from D:/<git>/mingw64/bin/` 与头文件路径 `D:/mingw64/include/c++/16.2.0` **不是同一套**。
 
 ---
