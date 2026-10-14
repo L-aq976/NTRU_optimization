@@ -2,25 +2,29 @@
 
 > 赛题 A1-4：**基于格密码的代理重加密算法设计与优化实现**
 > 项目主题：**面向多跳可用性的 NTRU 代理重加密 —— 门限多代理委托、失败概率预算与 GPU 批量实现**
-> 骨架版本：2026-10-12
+> 版本：2026-10-14（骨架初版 2026-10-12）
+> 现状：C1 已完成；**C2 已完成**（报告见 `docs/C2_报告.md`）；C3 仍为骨架
 
 ---
 
 ## 0. 30 秒看懂这个骨架
 
-已经跑通的东西（在本机 Windows + MinGW g++ 上实测）：
+已经跑通的东西（在本机 Windows + MinGW-w64 g++ 上实测；**时序数字与机器相关**）：
 
 ```
 $ bin/ntru_cli.exe selftest      # 21 项全部通过
 $ bin/ntru_cli.exe walkthrough   # ★ 教学参数(n=7)下的完整流程预演，每一步都打印全部系数
 $ bin/ntru_cli.exe smoke EES439 3 2
-   KeyGen 1.18ms / Enc 0.11ms / Dec 0.10ms / ReKeyGen 0.10ms / ReEnc 0.23ms
-   门限 (n=3,t=2): 子集数 3, 噪声 698（相对基线 ×1.40）
+   KeyGen 1.73ms / Enc 0.16ms / Dec 0.16ms / ReKeyGen 0.16ms / ReEnc 0.34ms
+   Enc 噪声 184 / 重加密噪声 499 / 门限(n=3,t=2) 噪声 698（相对基线 ×1.40）
 $ python pyref/cross_check.py EES439 7     # C++ 与 Python 参考实现 9 项代数关系全部一致
+$ python pyref/hop_sim.py --selftest       # ★ C2 数值核心的 7 类硬断言（含与 C++ 引擎逐位对拍）
+$ python pyref/mc_failprob.py              # ★ C2：跑 δ(h) 曲线 + 跳数预算，落三张 CSV
 ```
 
-即：**NTRU 五个算法 + 门限分享/部分重加密/组合 + 跨语言一致性校验**都已经能跑。
-流程讲解见 **[docs/01_加密流程预演.md](docs/01_加密流程预演.md)**（两个对象走完全程，每个数字都能手工验算）。
+即：**NTRU 五个算法 + 门限分享/部分重加密/组合 + 跨语言一致性校验 + C2 失败概率预算**都已经能跑。
+流程讲解见 **[docs/01_加密流程预演.md](docs/01_加密流程预演.md)**（两个对象走完全程，每个数字都能手工验算）；
+C2 的结论见 **[docs/C2_报告.md](docs/C2_报告.md)**。
 
 ---
 
@@ -46,7 +50,7 @@ $ python pyref/cross_check.py EES439 7     # C++ 与 Python 参考实现 9 项�
 ├── build.ps1                  ← Windows 快速构建（纯 ASCII，避免 GBK 坑）
 ├── src/
 │   ├── core/
-│   │   ├── params.h/.cpp         参数集（EES439/1087/1171/1499）+ 自检
+│   │   ├── params.h/.cpp         参数集（EES1087/1171/1499 + APR2011_439*）+ 自检
 │   │   ├── ring.h/.cpp           Z_q[x]/(x^n-1)：三层乘法（ref / int64 / int32分块）
 │   │   ├── poly_inv.h/.cpp       多项式求逆：GF(2) 扩展欧几里得 + Hensel 提升到 mod 2^16
 │   │   ├── sampler.h/.cpp        三元固定重量采样 / 均匀采样 / 随机源（含 CSPRNG TODO）
@@ -78,6 +82,9 @@ $ python pyref/cross_check.py EES439 7     # C++ 与 Python 参考实现 9 项�
 ```
 
 ★ 标记的文件是创新点落点：C1 = `threshold.*`，C2 = `hop_sim.py` + `mc_failprob.py`，C3 = `gpu_kernel.py`。
+
+\* 代码里沿用旧名 `EES439`；该组参数来自 ntru 的 **`APR2011_439`**（EES 族**没有** 439）。
+它的字段曾被错读、已于 2026-10-14 修正，见 `docs/C2_实现进度.md` §4.5(b)。
 ★★ 标记的两个文件回答"**格密码体现在哪**"：算法算环、难度靠格，`attack_lattice.py` 是唯一显式写出格矩阵的地方。
 
 ---
@@ -86,22 +93,33 @@ $ python pyref/cross_check.py EES439 7     # C++ 与 Python 参考实现 9 项�
 
 ### Windows（快速迭代，本机已可用）
 ```powershell
-cd 最终方案
 powershell -ExecutionPolicy Bypass -File .\build.ps1 -Test    # 编译 + 自检
 .\bin\ntru_cli.exe smoke EES439 3 2
 python pyref\cross_check.py EES439 7
+python pyref\hop_sim.py --selftest                            # C2 数值核心自检
 ```
 
 ### WSL / Linux（正式实验，推荐）
 ```bash
-cd 最终方案
-make                 # 编译 bin/ntru_cli 与 bin/ntru_tests
+make                 # 编译 bin/ntru_cli 与 bin/ntru_tests（在仓库根目录执行）
 make test            # 单元测试
 make run             # EES439 冒烟
 make bench           # 环乘法微基准
 python3 pyref/cross_check.py EES439 7
 python3 pyref/gpu_kernel.py --backend cupy --n 1171 --batch 8192   # 需要 CuPy
 ```
+
+### C2：多跳失败概率预算（纯 Python，不需要编译）
+```bash
+python pyref/hop_sim.py --selftest                   # 7 类硬断言（含与 C++ 引擎逐位对拍）
+python pyref/mc_failprob.py                          # 4 个参数集：δ(h) 曲线 + 跳数预算 + 三张 CSV
+python pyref/mc_failprob.py --params EES1171 --samples 200000
+python pyref/mc_failprob.py --m-list 1,3,5,10,15     # 门限（C1）代价曲线：m = C(N,t−1)
+python pyref/mc_failprob.py --m-list 1,5,15 --jobs 16  # 并行度（默认 8）
+python pyref/mc_failprob.py --cgf-sweep 50000,200000,800000   # 尾部外推的收敛性检查
+```
+**调参提示**：`--cgf-samples` **不要往下调**（实测 20 万以上才收敛）；`--samples` 决定 MC 能测到的
+δ 下限（3 万样本约 `3e-5`）；`--jobs` 只在配置之间并行，单个配置内部仍是单线程。
 
 ### 已实测的性能基线（本机 Windows/MinGW，**仅作参考**）
 | n | poly_mul_ref | poly_mul_fast(int64) | poly_mul_i32(分块) |
@@ -114,6 +132,9 @@ python3 pyref/gpu_kernel.py --backend cupy --n 1171 --batch 8192   # 需要 CuPy
 ## 4. 两条必须知道的口径问题
 
 ### 4.1 你原来的 CPU 与 GPU 基准口径不一致 ⚠️
+
+> 注：下表提到的 `bench/cpu_*.c`、`bench/gpu_kernel_v1.py` 等文件**不在本仓库内**（属于早期的另一份基准代码）。
+> 这里保留结论，是为了说明"重测时口径必须统一"这条方法学要求。
 
 | 文件 | 系数分布 | 累加类型 | 是否满量程安全 |
 |---|---|---|---|
@@ -149,8 +170,10 @@ python3 pyref/gpu_kernel.py --backend cupy --n 1171 --batch 8192   # 需要 CuPy
 - [x] **格在哪里的实证**：`pyref/attack_lattice.py` 显式构造 2n 维格 Λ_h + LLL，
       在 TINY7 上**精确恢复私钥**（0.29 s）；真实参数给出"LLL 差 2^219 倍"的量化说明（见 `docs/02_格在哪里.md`）
 - [x] **C2 失败概率预算**：`pyref/hop_sim.py` + `pyref/mc_failprob.py` 自包含跑出 δ(h) 曲线，
-      用鞍点模型外推到 `2^-40` 并反解 `h_max(δ, 参数, 门限配置)`。
-      噪声核公式已用 C++ 引擎导出的 `bin/vectors_EES439_7.txt` **逐位对拍**（见 `docs/C2_实现进度.md`）
+      用鞍点（Lugannani–Rice）模型外推到 `2^-40` 并反解 `h_max(δ, 参数, 门限配置)`；
+      门限（C1）的 `m = C(N,t−1)` 耦合已计入，产出"腐化阈值 ↑ → 可用跳数 ↓"代价曲线。
+      噪声核公式已用 C++ 引擎导出的测试向量 **逐位对拍**（`tests/fixtures/`，见 `docs/C2_实现进度.md`）。
+      **结论与局限见 [docs/C2_报告.md](docs/C2_报告.md)**（与论文 Table 4 对拍：4 个参数集里 3 个一致）
 
 ### 下一步（按优先级）
 1. **CSPRNG**：把 `Rng` 换成 `getrandom`/`BCryptGenRandom`（`sampler.h` 里有 TODO）。正式密钥生成**不能**用 `mt19937_64`。
@@ -159,9 +182,11 @@ python3 pyref/gpu_kernel.py --backend cupy --n 1171 --batch 8192   # 需要 CuPy
    它是"腐化阈值从 1 提到 t"这个主张的量化依据。WSL 里装 fpylll 后可跑大维数 + BKZ。
 3. **C1 的完整论证**：把 `docs/00_design.md` 里"待验证命题"逐条推完（尤其 partial 的 mod p 泄漏）。
 4. **C3**：把 `poly_mul_i32` 的分块归约搬进 CuPy 核（`gpu_kernel.py` 已给骨架），并用**同分布**重测 CPU/GPU。
-5. **C2 收尾**：① 查清 `docs/C2_实现进度.md` §4.4 记的 **EES1087 与论文 Table 4 不一致**
-   （我们算出 δ(21)=56.7%，设计文档认为应约 10%；其余三个参数集都对上了）；
-   ② 门限联合表（`--m-list`）跑全；③ `--backend cupy` 在 WSL 里实测，把 MC 样本量提到 1e7+ 让 δ 测到 1e-6。
+5. **C2 剩余两项**（主体已完成，见 `docs/C2_报告.md`）：
+   ① **`--backend cupy` 在 WSL 里实测** —— 现在 δ 的实测下限约 `3e-5`，进一步降低需要 GPU 与 `~1e7` 样本；
+   ② **EES1087 与论文 Table 4 的口径差异** —— 参数、噪声分布、`f = 1+p·F` 约定、解密判据均已逐项核对无误；
+   换用论文自己的"平均可支撑跳数"定义时结论会反转（EES1087 反而吻合、另外三个偏高 30~40%）。
+   **两种口径尚未统一，报告里应并列给出而不是择一断言**。定性需要复现其原始实验流程。
 6. **参数安全估计**：用 lattice-estimator / BKZ 成本模型把 `(n,q,df,dg)` 换成安全位数（`docs/02_格在哪里.md` §5）。
 7. 每完成一步，把数字写进 `bench/results/*.csv`（**已建**：C2 的三张表在那里）。
 
@@ -175,10 +200,10 @@ python3 pyref/gpu_kernel.py --backend cupy --n 1171 --batch 8192   # 需要 CuPy
 - **`-march=native`**：Windows MinGW 8.1 与 WSL gcc 13.3 都支持，但两者的自动向量化质量不同，性能数字必须注明编译器。
 - **⚠️ Windows 上必须加 `-static-libstdc++ -static-libgcc`**（`build.ps1` 已加）。
   Git for Windows 自带一份**较旧的** `libstdc++-6.dll` 并把它排在 PATH 前面，动态链接的 exe 运行时会绑到**那一份**，
-  与编译时用的 `D:/mingw64`（g++ 16.2）头文件 ABI 不一致 → 访问违例。
+  与编译时那套 MinGW-w64（g++ 16.2）的头文件 ABI 不一致 → 访问违例。
   **症状很有迷惑性**：`selftest` / `smoke` / `bench` 全都正常，**只有 `vectors` 段错误** ——
   因为它是唯一构造 `std::ofstream` 的子命令，崩的位置在 `basic_ofstream` 构造函数里，看起来像源码 bug。
   排查：`g++ -g -O2 ... && gdb -batch -ex run -ex bt --args ...`；栈里会看到
-  `libstdc++-6.dll from D:/<git>/mingw64/bin/` 与头文件路径 `D:/mingw64/include/c++/16.2.0` **不是同一套**。
+  两个 DLL 的来路不同：一个来自 Git for Windows 自带的 MinGW，一个来自独立安装的 MinGW-w64。
 
 ---
