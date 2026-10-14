@@ -276,7 +276,6 @@ def simulate_curve(P: RingParams, max_hops: int, samples: int,
     """
     be = get_backend(backend)
     xp = be.xp
-    rng = xp.random.default_rng(seed)
     n = P.ring_n
     if batch is None:
         batch = default_batch(be, n)
@@ -285,8 +284,14 @@ def simulate_curve(P: RingParams, max_hops: int, samples: int,
     per_hop_need = max(1, cgf_sub // max_hops) if cgf_sub > 0 else 0
     coeff = [[] for _ in range(max_hops + 1)]
     done = 0
+    bi = 0
     while done < samples:
         b = int(min(batch, samples - done))
+        # **每个批次独立播种**（用 (seed, 批次号) 而不是一条全局流）。
+        # 否则每个批次消费的随机数个数 = max_hops × 2，后批次的链会随 max_hops 变化 ——
+        # 结果仍然无偏，但同一个 seed 下换个跳数范围就得到不同的数字，不可复现。
+        rng = xp.random.default_rng([int(seed), bi])
+        bi += 1
         g = sample_fixed_weight(rng, xp, b, n, P.dg, P.dg)
         s = sample_fixed_weight(rng, xp, b, n, P.dr, P.dr)
         FA = sample_fixed_weight(rng, xp, b, n, P.df, P.df)
