@@ -122,10 +122,12 @@ Poly poly_mul_fast(const Poly& a, const Poly& b, int64_t q) {
 //   每累加 BLK 项后把 acc 归约一次（acc &= q-1），保证 int32 不溢出。
 //   这是性能工作的起点：CUDA/OpenMP/寄存器分块都在这个结构上做。
 // ---------------------------------------------------------------------------
-Poly poly_mul_i32(const Poly& a, const Poly& b, int64_t q) {
+Poly poly_mul_i32_scratch(const Poly& a, const Poly& b, int64_t q,
+                          std::vector<int16_t>& aa, std::vector<int16_t>& bb,
+                          std::vector<int32_t>& acc) {
     const int n = (int)a.size();
     if (!is_pow2(q) || q > 2048)
-        throw std::invalid_argument("poly_mul_i32: 仅支持 q 为 2 的幂且 q <= 2048");
+        throw std::invalid_argument("poly_mul_i32_scratch: 仅支持 q 为 2 的幂且 q <= 2048");
 
     const int32_t mask = (int32_t)(q - 1);
     const int64_t qm1 = q - 1;
@@ -133,12 +135,14 @@ Poly poly_mul_i32(const Poly& a, const Poly& b, int64_t q) {
     int BLK = (int)(blk64 < n ? blk64 : n);
     if (BLK < 1) BLK = 1;
 
-    std::vector<int16_t> aa(n), bb(n);
+    // 复用外部缓冲：resize/assign 在首次分配后不再触发堆分配，
+    // 去掉每次调用的 malloc 开销，使 CPU 计时与 GPU kernel-only 口径对齐。
+    aa.resize(n); bb.resize(n);
     for (int i = 0; i < n; ++i) {
         aa[i] = (int16_t)a[i];
         bb[i] = (int16_t)b[i];
     }
-    std::vector<int32_t> acc(n, 0);
+    acc.assign(n, 0);
 
     for (int i = 0; i < n; ++i) {
         const int32_t ai = aa[i];
@@ -165,6 +169,12 @@ Poly poly_mul_i32(const Poly& a, const Poly& b, int64_t q) {
     Poly c(n, 0);
     for (int k = 0; k < n; ++k) c[k] = acc[k] & mask;
     return c;
+}
+
+Poly poly_mul_i32(const Poly& a, const Poly& b, int64_t q) {
+    std::vector<int16_t> aa, bb;
+    std::vector<int32_t> acc;
+    return poly_mul_i32_scratch(a, b, q, aa, bb, acc);
 }
 
 // ---------------------------------------------------------------------------
