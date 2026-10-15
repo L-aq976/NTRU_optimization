@@ -1,18 +1,19 @@
-﻿"""C3 鏍稿績瀹為獙锛堜慨姝ｇ増锛夛細鍥涚 GPU 鏍稿悓鏉′欢瀵规瘮 + 姝ｇ‘鎬с€?
-v1 = 鐜版湁瀹炵幇锛歩nt64 绯绘暟 / int64 绱姞 / 鍒楀紡 / 鍏变韩 sa,sb
-v2 = int16 杈撳叆 + int32 鍏变韩 + int32 绱姞 + 鍒楀紡 + 鍒嗗潡褰掔害锛堝繀闇€锛?v3 = 瀛楅潰鎼?poly_mul_i32锛氳寮?+ acc[] 甯搁┗ shared + 姣忚 __syncthreads + 鍒嗗潡褰掔害
-v4 = 鍙惉 poly_mul_i32 鐨勩€屼袱娈垫媶鍒嗗幓鍒嗘敮銆嶏細int32 鍒楀紡锛屼絾鎶?j=k-i 鐨?if(j<0) 鍒嗘敮鍘绘帀
+"""C3 核心实验（修正版）：四种 GPU 核同条件对比 + 正确性。
+v1 = 现有实现：int64 系数 / int64 累加 / 列式 / 共享 sa,sb
+v2 = int16 输入 + int32 共享 + int32 累加 + 列式 + 分块归约（必需）
+v3 = 字面搬 poly_mul_i32：行式 + acc[] 常驻 shared + 每行 __syncthreads + 分块归约
+v4 = 只搬 poly_mul_i32 的「两段拆分去分支」：int32 列式，但把 j=k-i 的 if(j<0) 分支去掉
 
-瑕佸洖绛旓細
-  a) int64 -> int32 鍊煎灏戯紵
-  b) 銆屾妸 poly_mul_i32 鐨勮寮忕疮鍔犲櫒甯冨眬鎼笂 GPU銆嶆槸鍚︽垚绔嬶紵
-  c) 銆屼袱娈垫媶鍒嗐€嶈繖涓敼娉曞崟鐙€煎灏戯紵
+要回答：
+  a) int64 -> int32 值多少？
+  b) 「把 poly_mul_i32 的行式累加器布局搬上 GPU」是否成立？
+  c) 「两段拆分」这个改法单独值多少？
 """
 import numpy as np
 import cupy as cp
 
 N, Q, MASK, REDU, THREADS = 1171, 2048, 2047, 256, 256
-CPU_US = 150.06   # 鏈満 i9-14900HX + MinGW g++ -O3 -march=native, poly_mul_i32
+CPU_US = 150.06   # 本机 i9-14900HX + MinGW g++ -O3 -march=native, poly_mul_i32
 
 V1 = r"""
 extern "C" __global__ void k_v1(const long long* __restrict__ A, const long long* __restrict__ B,
@@ -91,12 +92,12 @@ extern "C" __global__ void k_v4(const short* __restrict__ A, const short* __rest
     __syncthreads();
     for (int k = threadIdx.x; k < n; k += blockDim.x) {
         int acc = 0; int cnt = 0;
-        // 娈典竴锛歩 = 0..k  ->  j = k-i 锛堥€掑璁块棶 sb锛屾棤璐熺储寮曪級
+        // 段一：i = 0..k  ->  j = k-i （递增访问 sb，无负索引）
         for (int i = 0; i <= k; ++i) {
             acc += sa[i] * sb[k - i];
             if (++cnt == redu) { acc &= mask; cnt = 0; }
         }
-        // 娈典簩锛歩 = k+1..n-1  ->  j = k-i+n
+        // 段二：i = k+1..n-1  ->  j = k-i+n
         for (int i = k + 1; i < n; ++i) {
             acc += sa[i] * sb[k - i + n];
             if (++cnt == redu) { acc &= mask; cnt = 0; }
@@ -121,9 +122,9 @@ def make16(batch, seed=7):
 k = {v: cp.RawKernel(src, f"k_{v}") for v, src in
      [("v1", V1), ("v2", V2), ("v3", V3), ("v4", V4)]}
 
-# dtype 蹇呴』鍜屾牳绛惧悕涓ユ牸涓€鑷达細
-#   杈撳叆 v1 = int64, v2/v3/v4 = int16   锛圧awKernel 涓嶆牎楠岋紝浼犻敊灏辨槸闈欓粯瓒婄晫/閿欐暟鎹級
-#   杈撳嚭 v1 = int64, v2/v3/v4 = int32
+# dtype 必须和核签名严格一致：
+#   输入 v1 = int64, v2/v3/v4 = int16   （RawKernel 不校验，传错就是静默越界/错数据）
+#   输出 v1 = int64, v2/v3/v4 = int32
 DT    = {"v1": np.int64, "v2": np.int16, "v3": np.int16, "v4": np.int16}
 DTOUT = {"v1": np.int64, "v2": np.int32, "v3": np.int32, "v4": np.int32}
 SHMEM = {"v1": 2*N*8,    "v2": 2*N*4,    "v3": N*4,      "v4": 2*N*4}
@@ -139,19 +140,19 @@ def launch(v, batch, dA, dB, dC):
 print(f"n={N} q={Q} redu/BLK={REDU} threads={THREADS}")
 print(f"shmem: v1={SHMEM['v1']}B  v2={SHMEM['v2']}B  v3={SHMEM['v3']}B  v4={SHMEM['v4']}B")
 ok_ovf = N*(Q-1)**2 > 2**31-1
-print(f"int32 婧㈠嚭: n*(q-1)^2={N*(Q-1)**2:,} > 2^31-1={2**31-1:,} -> "
-      f"{'鏄紝int32 蹇呴』鍒嗗潡褰掔害' if ok_ovf else '鍚?}\n")
+print(f"int32 溢出: n*(q-1)^2={N*(Q-1)**2:,} > 2^31-1={2**31-1:,} -> "
+      f"{'是，int32 必须分块归约' if ok_ovf else '否'}\n")
 
-# ---------- 姝ｇ‘鎬?----------
+# ---------- 正确性 ----------
 CB = 4
 A16, B16 = make16(CB)
 refC = np.stack([ref_cyclic(A16[t], B16[t], N, Q) for t in range(CB)])
-print("=== 姝ｇ‘鎬э紙batch=4, n=1171, 褰掔害鐪熺殑瑙﹀彂锛?==")
+print("=== 正确性（batch=4, n=1171, 归约真的触发）===")
 correct = {}
 for v in ["v1", "v2", "v3", "v4"]:
     dA = cp.asarray(A16.astype(DT[v])); dB = cp.asarray(B16.astype(DT[v]))
     dC = cp.empty((CB, N), dtype=DTOUT[v])
-    label = {"v1": "v1 int64 鍒楀紡", "v2": "v2 int32 鍒楀紡", "v3": "v3 琛屽紡shared-acc", "v4": "v4 int32 涓ゆ鍘诲垎鏀?}[v]
+    label = {"v1": "v1 int64 列式", "v2": "v2 int32 列式", "v3": "v3 行式shared-acc", "v4": "v4 int32 两段去分支"}[v]
     try:
         launch(v, CB, dA, dB, dC)
         cp.cuda.Stream.null.synchronize()
@@ -166,8 +167,8 @@ for v in ["v1", "v2", "v3", "v4"]:
         correct[v] = False
         print(f"  {label:22s} ERROR {type(e).__name__}: {str(e)[:160]}")
 
-# ---------- 鎬ц兘 ----------
-print("\n=== kernel-only锛圕UDA event, 棰勭疆 device buffer, 宸?warmup锛?==")
+# ---------- 性能 ----------
+print("\n=== kernel-only（CUDA event, 预置 device buffer, 带 warmup）===")
 BATCHES = [1, 16, 64, 256, 1024, 4096, 8192]
 rows = []
 for batch in BATCHES:
@@ -188,13 +189,13 @@ for batch in BATCHES:
         out[v] = cp.cuda.get_elapsed_time(e0, e1) / reps / 1000.0
     rows.append((batch, out))
 
-h = f"{'batch':>7} | {'v1 int64':>10} {'v2 int32':>10} {'v3 琛屽紡':>10} {'v4 涓ゆ':>10} | {'v2/v1':>6} {'v3/v1':>6} {'v4/v1':>6}"
+h = f"{'batch':>7} | {'v1 int64':>10} {'v2 int32':>10} {'v3 行式':>10} {'v4 两段':>10} | {'v2/v1':>6} {'v3/v1':>6} {'v4/v1':>6}"
 print(h); print("-"*len(h))
 for batch, out in rows:
     print(f"{batch:>7} | {out['v1']*1e6:>8.1f}us {out['v2']*1e6:>8.1f}us {out['v3']*1e6:>8.1f}us {out['v4']*1e6:>8.1f}us | "
           f"{out['v1']/out['v2']:>5.2f}x {out['v1']/out['v3']:>5.2f}x {out['v1']/out['v4']:>5.2f}x")
 
-print(f"\n=== 姣忔鍗风Н us/conv锛圕PU poly_mul_i32 = {CPU_US}us锛?==")
+print(f"\n=== 每次卷积 us/conv（CPU poly_mul_i32 = {CPU_US}us）===")
 h2 = f"{'batch':>7} | {'v1':>9} {'v2':>9} {'v3':>9} {'v4':>9} | {'CPU/v2':>7} {'CPU/v3':>7} {'CPU/v4':>7}"
 print(h2); print("-"*len(h2))
 for batch, out in rows:
