@@ -31,8 +31,13 @@ void Params::validate() const {
 }
 
 // ---------------------------------------------------------------------------
-// EES 参数族：q = 2048, p = 3
-// 与 A1-4_选题方案/multihop_failprob_gpu.py 中使用的参数一致
+// 参数族：q = 2048, p = 3，取自 ntru (tbuktu/ntru) 的 EncryptionParameters
+//
+// ⚠️ 读 ntru 的构造签名时注意：它是
+//        (N, q, df, dm0, maxM1, db, c, minCallsR, minCallsMask, ...)
+//    而 **dg 与 dr 不是独立参数**，库在 init() 里推导：
+//        dr = df;      dg = N / 3;
+//    （product-form 变体才另给 df1/df2/df3，那一路我们不模拟）
 // ---------------------------------------------------------------------------
 static Params make_ees(const char* name, int n, int df, int dg, int dr, int dm0, int dm1) {
     Params P;
@@ -48,8 +53,13 @@ static Params make_ees(const char* name, int n, int df, int dg, int dr, int dm0,
     return P;
 }
 
+// 注意：这一组在 ntru 里叫 APR2011_439（**不是 EES 族** —— EES 族没有 439），
+// 128 位安全。ntru 里的定义是 (N=439, q=2048, df=146, dm0=130, maxM1=126, db=128)，
+// 由 dg = N/3、dr = df 得 dg = dr = 146。
+// 旧版把 (df, dm0, maxM1, db) 误读成了 (df, dg, dr, dm0)，已于 2026-10-14 修正；
+// 详见 docs/C2_实现进度.md §4.5(b)（修正后 δ≈10% 的跳数从 6 变 5，与论文 Table 4 一致）。
 const Params& param_ees439() {
-    static const Params P = make_ees("EES439", 439, 146, 130, 126, 128, 128);
+    static const Params P = make_ees("EES439", 439, 146, 146, 146, 130, 126);
     return P;
 }
 const Params& param_ees1087() {
