@@ -56,6 +56,12 @@ Poly poly_mul_fast(const Poly& a, const Poly& b, int64_t q);
 //   参考：NTRUReEncrypt_GPU/bench/cpu_splitloop.c（同一套循环结构）
 Poly poly_mul_i32(const Poly& a, const Poly& b, int64_t q);
 
+// 复用外部 scratch 的版本：避免每次调用分配 aa/bb/acc 三个临时数组，
+// 用于基准测试的公平计时（与 GPU kernel-only 的"预置 device buffer"口径对齐）。
+Poly poly_mul_i32_scratch(const Poly& a, const Poly& b, int64_t q,
+                          std::vector<int16_t>& aa, std::vector<int16_t>& bb,
+                          std::vector<int32_t>& acc);
+
 // 中心代表与范数
 Poly    poly_center(const Poly& a, int64_t q);              // 输出 (-q/2, q/2]
 int64_t poly_inf_norm_center(const Poly& a, int64_t q);     // 中心代表的无穷范数

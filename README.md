@@ -124,8 +124,12 @@ python pyref/mc_failprob.py --cgf-sweep 50000,200000,800000   # 尾部外推的�
 ### 已实测的性能基线（本机 Windows/MinGW，**仅作参考**）
 | n | poly_mul_ref | poly_mul_fast(int64) | poly_mul_i32(分块) |
 |---|---|---|---|
-| 439 | 560 µs | 91 µs | — |
-| 1171 | 3199 µs | 643 µs | **289 µs** |
+| 439 | 394 µs | 96 µs | 21.5 µs |
+| 1171 | 2831 µs | 543 µs | **148–153 µs** |
+
+> 注：`poly_mul_i32` 每次调用的 3 次 `std::vector` 分配开销实测可忽略
+> （提出分配后 152.5µs vs 148.4µs，属噪声，见 `poly_mul_i32_scratch`）。
+> 旧表里的 289µs 是 MinGW 8.1 的数，本机新编译器快近一倍。
 
 ---
 
@@ -141,9 +145,15 @@ python pyref/mc_failprob.py --cgf-sweep 50000,200000,800000   # 尾部外推的�
 | `bench/cpu_schoolbook.c` / `cpu_splitloop.c` / `cpu_openmp.c` | **三元** `rand()%3-1` | int32 | 只对三元安全 |
 | `bench/gpu_kernel_v1.py` / `v2.py` / `gpu_transfer.py` | **满量程** `randint(0,2048)` | int64 / int32+归约 | 是 |
 
-结论：**"CPU 59 µs vs GPU 233 µs；批量 104k/s vs 391k/s；GPU 3.7×" 这组数字比较的是两种不同负载**
-（三元乘法的代价远低于满量程 mod q 乘法，而且 `if(!ai) continue` 还跳掉了 1/3 的行）。
-本项目必须用**同分布**重测，把这张表重做一遍——这既是必须做的修正，也是报告里可以写的一条方法学贡献。
+结论：**"CPU 59 µs vs GPU 233 µs、GPU 3.7×" 这组数字比较的是两种不同负载**（三元 vs 满量程），
+而且旧 GPU 基准把 H2D/D2H 搬运也算进了计时区间。**同机同分布（满量程 [0,2048)）重测后，该结论被推翻**：
+
+| n=1171，每次卷积 | CPU `poly_mul_i32` | GPU (C3, kernel-only) | GPU (C3, 端到端) |
+|---|---|---|---|
+| batch=8192 | ~150 µs | **2.03 µs（75×）** | 14.6 µs（10.5×） |
+
+GPU 优势只在批量下成立：batch=1 时 kernel-only 78µs、端到端约 211µs，交叉点约在
+batch≈2–4。完整曲线见 `bench/results/gpu_kernel_sweep_i32twoseg.csv`。
 
 ### 4.2 哪些乘法是满量程的？
 
@@ -188,7 +198,8 @@ python pyref/mc_failprob.py --cgf-sweep 50000,200000,800000   # 尾部外推的�
    换用论文自己的"平均可支撑跳数"定义时结论会反转（EES1087 反而吻合、另外三个偏高 30~40%）。
    **两种口径尚未统一，报告里应并列给出而不是择一断言**。定性需要复现其原始实验流程。
 6. **参数安全估计**：用 lattice-estimator / BKZ 成本模型把 `(n,q,df,dg)` 换成安全位数（`docs/02_格在哪里.md` §5）。
-7. 每完成一步，把数字写进 `bench/results/*.csv`（**已建**：C2 的三张表在那里）。
+7. **[x]** `bench/results/*.csv` 已建：C2 的三张表 + C3 的 `gpu_kernel_sweep_i32twoseg.csv`、
+   `gpu_kernel_sweep_i64.csv`、`gpu_kernel_variants.csv`（+ `bench/kernel_variants.py` 复现脚本）。
 
 ---
 
