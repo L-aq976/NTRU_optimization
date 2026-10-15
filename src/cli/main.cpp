@@ -391,10 +391,22 @@ static int cmd_bench(const std::string& pname, int iters) {
     }
     double t_i32 = ms_since(t0);
 
+    // 复用 scratch（无分配）：与 GPU kernel-only 的"预置 device buffer"口径对齐
+    std::vector<int16_t> aa, bb;
+    std::vector<int32_t> acc;
+    t0 = Clock::now();
+    for (int i = 0; i < iters; ++i) {
+        Poly c = poly_mul_i32_scratch(a, b, P.q, aa, bb, acc);
+        sink += c[0];
+    }
+    double t_i32s = ms_since(t0);
+
     // 正确性抽检（避免"快但错"）
     Poly cr = poly_mul_ref(a, b, P.q);
     Poly ci = poly_mul_i32(a, b, P.q);
     check(poly_equal(cr, ci), "bench 前抽检：poly_mul_i32 == poly_mul_ref");
+    Poly cis = poly_mul_i32_scratch(a, b, P.q, aa, bb, acc);
+    check(poly_equal(cr, cis), "bench 前抽检：poly_mul_i32_scratch == poly_mul_ref");
 
     std::printf("=== 环乘法微基准：%s (n=%d) 迭代 %d 次 ===\n", P.name.c_str(), P.n, iters);
     std::printf("  poly_mul_ref : %8.2f ms 总 / %8.3f us 每次 / %10.0f 次每秒\n",
@@ -403,7 +415,10 @@ static int cmd_bench(const std::string& pname, int iters) {
                 t_fast, t_fast * 1000.0 / iters, iters * 1000.0 / t_fast);
     std::printf("  poly_mul_i32 : %8.2f ms 总 / %8.3f us 每次 / %10.0f 次每秒\n",
                 t_i32, t_i32 * 1000.0 / iters, iters * 1000.0 / t_i32);
-    std::printf("  加速比 ref/fast = %.2fx, ref/i32 = %.2fx\n", t_ref / t_fast, t_ref / t_i32);
+    std::printf("  i32(scratch) : %8.2f ms 总 / %8.3f us 每次 / %10.0f 次每秒  <-- 公平基线\n",
+                t_i32s, t_i32s * 1000.0 / iters, iters * 1000.0 / t_i32s);
+    std::printf("  加速比 ref/fast = %.2fx, ref/i32 = %.2fx, ref/i32s = %.2fx\n",
+                t_ref / t_fast, t_ref / t_i32, t_ref / t_i32s);
     (void)sink;
     return 0;
 }
