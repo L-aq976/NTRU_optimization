@@ -67,6 +67,17 @@ Poly threshold_combine(const Params& P, const ThresholdCtx& ctx,
                        const std::vector<std::vector<Poly>>& partials,
                        const std::vector<int>& W);
 
+// 尽力而为的组合（用于实验演示"t-1 个代理不行"）：
+//   |W| < t 时，把能拿到的份额都加起来，拿不到的（与 W 不相交的子集）计入 missing。
+//   注意这里不是"代码拦截"，而是真的少了一份均匀随机的份额 —— 结果必然解不出明文。
+Poly threshold_combine_best_effort(const Params& P, const ThresholdCtx& ctx,
+                                   const std::vector<std::vector<Poly>>& partials,
+                                   const std::vector<int>& W, int* missing_subsets);
+
+// 返回与参与集合 W 不相交的子集（|W| = t-1 时恰好一个）；找不到返回 false
+bool threshold_missing_subset(const ThresholdCtx& ctx, const std::vector<int>& W,
+                              uint32_t* missing_mask);
+
 struct ThresholdResult {
     Poly ct;
     int64_t noise_inf;

@@ -17,6 +17,16 @@
 #include <cstdio>
 #include <vector>
 
+#if defined(_WIN32)
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#endif
+
 using namespace ntru;
 
 static int g_fail = 0;
@@ -190,6 +200,9 @@ static void test_real_params() {
 }
 
 int main() {
+#if defined(_WIN32)
+    SetConsoleOutputCP(CP_UTF8);   // Windows 控制台切 UTF-8，避免中文乱码
+#endif
     std::printf("=== 单元测试开始 ===\n");
     test_ring();
     test_inverse();

@@ -120,4 +120,45 @@ ThresholdResult threshold_reencrypt_checked(const Params& P, const ThresholdCtx&
     return r;
 }
 
+bool threshold_missing_subset(const ThresholdCtx& ctx, const std::vector<int>& W,
+                              uint32_t* missing_mask) {
+    for (uint32_t S : ctx.subsets) {
+        bool inter = false;
+        for (int p : W)
+            if (S & (1u << p)) inter = true;
+        if (!inter) {
+            if (missing_mask) *missing_mask = S;
+            return true;
+        }
+    }
+    return false;
+}
+
+Poly threshold_combine_best_effort(const Params& P, const ThresholdCtx& ctx,
+                                   const std::vector<std::vector<Poly>>& partials,
+                                   const std::vector<int>& W, int* missing_subsets) {
+    int missing = 0;
+    Poly acc = poly_zero(P.n);
+    for (uint32_t S : ctx.subsets) {
+        int owner = -1;
+        for (int p : W) {
+            if (S & (1u << p)) {
+                if (owner < 0 || p < owner) owner = p;
+            }
+        }
+        if (owner < 0) {                     // 该子集没有任何参与代理持有 -> 拿不到
+            ++missing;
+            continue;
+        }
+        int j = ctx.find(S, owner);
+        if (j < 0) {
+            ++missing;
+            continue;
+        }
+        acc = poly_add(acc, partials[owner][j], P.q);
+    }
+    if (missing_subsets) *missing_subsets = missing;
+    return acc;
+}
+
 }  // namespace ntru

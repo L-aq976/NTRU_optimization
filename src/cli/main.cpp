@@ -26,6 +26,30 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#  ifndef NOMINMAX
+#    define NOMINMAX          // 防止 windows.h 的 min/max 宏污染 std::min/std::max
+#  endif
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>        // SetConsoleOutputCP
+#endif
+
+// ---------------------------------------------------------------------------
+// Windows 控制台中文乱码的根治办法：
+//   源码里的中文字面量是 UTF-8 编码，而中文版 Windows 控制台默认代码页是 GBK(936)，
+//   字节被按 GBK 解释 -> 乱码。这里在程序启动时把控制台输入/输出代码页切成 UTF-8，
+//   这样在 VS Code 集成终端、cmd、PowerShell 里都能正常显示中文。
+//   （Linux/WSL 下本来就是 UTF-8，无需处理）
+// ---------------------------------------------------------------------------
+static void setup_console_utf8() {
+#if defined(_WIN32)
+    SetConsoleOutputCP(CP_UTF8);   // 输出代码页 -> 65001
+    SetConsoleCP(CP_UTF8);         // 输入代码页 -> 65001（本程序不读中文，一并设置）
+#endif
+}
+
 using namespace ntru;
 using Clock = std::chrono::steady_clock;
 
@@ -620,13 +644,181 @@ static int cmd_walkthrough() {
 }
 
 // ---------------------------------------------------------------------------
+// c1：C1（门限多代理委托）专项实验
+//   一次回答四个问题：
+//     ① 正确性：t 个代理能否完成转换并正确解密（成功率）
+//     ② 门限性：t-1 个代理"尽力而为"地组合，是否必然失败
+//     ③ 代价：噪声放大多大、各阶段耗时多少（子集数 = C(n,t-1)）
+//     ④ 零信息：t-1 个代理缺口的那份份额是不是均匀随机
+// ---------------------------------------------------------------------------
+static int cmd_c1(const std::string& pname, int trials, int zero_trials) {
+    const Params& P = param_by_name(pname);
+    struct Cfg { int n; int t; };
+    std::vector<Cfg> cfgs;
+    {
+        const Cfg c[] = {{2, 2}, {3, 2}, {4, 2}, {5, 2}, {5, 3}, {6, 3}, {7, 4}};
+        for (const Cfg& x : c) cfgs.push_back(x);
+    }
+
+    std::printf("================================================================================\n");
+    std::printf(" C1 门限多代理委托实验：%s\n", P.name.c_str());
+    std::printf(" 参数集 %s: n=%d, q=%d, p=%d, df=%d, dg=%d, dr=%d\n",
+                P.name.c_str(), P.n, P.q, P.p, P.df, P.dg, P.dr);
+    std::printf(" 每配置试验次数 = %d（噪声是随机的，必须多次采样才能估成功率）\n", trials);
+    std::printf(" 零信息检查试验次数 = %d（估计缺失份额的分布，需要大样本）\n", zero_trials);
+    std::printf(" 噪声预算 = q/2 = %d：解密时系数必须落在此范围内，否则中心代表绕回 → 解密失败\n",
+                P.q / 2);
+    std::printf(" 参与集合固定取前 t 个代理；基线 = 单代理直接转换\n");
+    std::printf("--------------------------------------------------------------------------------\n");
+    std::printf(" 列说明：\n");
+    std::printf("   配置      (n=代理总数, t=门限)；子集数 = C(n, t-1) = 需要几份部分重加密\n");
+    std::printf("   t个成功   t 个代理完成转换且解密正确的比例（应当 100%%）\n");
+    std::printf("   t-1个成功 t-1 个代理\"尽力而为\"组合后仍解密正确的比例（应当 0%%）\n");
+    std::printf("   基线噪声  单代理重加密后 ‖center(f_B·C')‖∞（越小越好，<= %d）\n", P.q / 2);
+    std::printf("   门限噪声  t 个代理组合后同一指标；放大 = 门限噪声/基线噪声\n");
+    std::printf("   分享/部分/组合 = 三个阶段各自的平均耗时（微秒）\n");
+    std::printf("================================================================================\n\n");
+    std::printf("%-10s %-7s %-9s %-11s %-9s %-9s %-7s %-8s %-8s %-8s\n",
+                "配置", "子集数", "t个成功", "t-1个成功", "基线噪声", "门限噪声", "放大",
+                "分享us", "部分us", "组合us");
+    std::printf("--------------------------------------------------------------------------------"
+                "----------------\n");
+
+    Rng rng(20261013ULL);
+    std::vector<std::string> csv_rows;
+
+    for (const Cfg& cfg : cfgs) {
+        int ok_t = 0, ok_tm1 = 0;
+        double nb = 0, nt = 0;
+        double t_share = 0, t_part = 0, t_comb = 0;
+        int subsets = 0;
+
+        for (int tr = 0; tr < trials; ++tr) {
+            KeyPair A, B;
+            if (!keygen(P, rng, A) || !keygen(P, rng, B)) continue;
+            Poly m = sample_message(P, rng);
+            Poly mc = message_to_center(m, P.p);
+            Poly c = encrypt(P, A.h, m, rng);
+            Poly rk = rekeygen(P, A.f, B.finv);
+
+            ReEncResult base = reencrypt_checked(P, B.f, c, rk, mc, rng);
+
+            Clock::time_point t0 = Clock::now();
+            ThresholdCtx ctx = cnf_share(P, rk, cfg.n, cfg.t, rng);
+            t_share += ms_since(t0);
+            subsets = ctx.num_subsets();
+
+            std::vector<int> W, Wm;
+            for (int i = 0; i < cfg.t; ++i) W.push_back(i);
+            for (int i = 0; i < cfg.t - 1; ++i) Wm.push_back(i);
+
+            // ① t 个代理：部分重加密 + 组合
+            t0 = Clock::now();
+            auto part = proxy_partials(P, ctx, c, rng);
+            t_part += ms_since(t0);
+            t0 = Clock::now();
+            Poly ct = threshold_combine(P, ctx, part, W);
+            t_comb += ms_since(t0);
+            int64_t noise_th = 0;
+            Poly dec = decrypt_with_noise(P, B.f, ct, noise_th);
+            bool okth = (dec.size() == mc.size());
+            for (std::size_t i = 0; okth && i < dec.size(); ++i)
+                if (dec[i] != mc[i]) okth = false;
+            if (okth) ++ok_t;
+            nt += (double)noise_th;
+            nb += (double)base.noise_inf;
+
+            // ② t-1 个代理：尽力而为地组合
+            auto part2 = proxy_partials(P, ctx, c, rng);
+            int missing = 0;
+            Poly ctm = threshold_combine_best_effort(P, ctx, part2, Wm, &missing);
+            int64_t noise_m = 0;
+            Poly decm = decrypt_with_noise(P, B.f, ctm, noise_m);
+            bool okm = (decm.size() == mc.size());
+            for (std::size_t i = 0; okm && i < decm.size(); ++i)
+                if (decm[i] != mc[i]) okm = false;
+            if (okm) ++ok_tm1;
+        }
+
+        double okr = 100.0 * ok_t / trials;
+        double okmr = 100.0 * ok_tm1 / trials;
+        double mb = nb / trials, mt = nt / trials;
+        char namebuf[32];
+        std::snprintf(namebuf, sizeof(namebuf), "(n=%d,t=%d)", cfg.n, cfg.t);
+        char okbuf[16], okmbuf[16];
+        std::snprintf(okbuf, sizeof(okbuf), "%.0f%%", okr);
+        std::snprintf(okmbuf, sizeof(okmbuf), "%.0f%%", okmr);
+        std::printf("%-10s %-7d %-9s %-11s %-9.0f %-9.0f %-7.2f %-8.1f %-8.1f %-8.1f\n",
+                    namebuf, subsets, okbuf, okmbuf, mb, mt,
+                    (mb > 0 ? mt / mb : 0.0),
+                    t_share * 1000 / trials, t_part * 1000 / trials, t_comb * 1000 / trials);
+
+        char row[256];
+        std::snprintf(row, sizeof(row), "%s,%d,%d,%d,%.2f,%.2f,%.3f,%.4f,%.4f,%.4f",
+                      P.name.c_str(), cfg.n, cfg.t, subsets, okr, okmr,
+                      (mb > 0 ? mt / mb : 0.0), t_share / trials, t_part / trials, t_comb / trials);
+        csv_rows.push_back(row);
+    }
+
+    // ---- 零信息性检查 ----
+    std::printf("\n【零信息性检查】取 (n=5,t=3)，联盟 W={P1,P2} 只有 t-1=2 个代理\n");
+    {
+        const int n5 = 5, t5 = 3;
+        std::vector<int> Wz = {0, 1};
+        double sum0 = 0, sum2 = 0, s0 = 0, s2 = 0;
+        int missing_total = 0;
+        for (int i = 0; i < zero_trials; ++i) {
+            Poly rk = sample_uniform(P.n, P.q, rng);
+            ThresholdCtx ctx = cnf_share(P, rk, n5, t5, rng);
+            uint32_t Sm = 0;
+            if (threshold_missing_subset(ctx, Wz, &Sm)) ++missing_total;
+            int owner = -1;
+            for (int p = 0; p < n5 && owner < 0; ++p)
+                if (Sm & (1u << p)) owner = p;
+            int j = ctx.find(Sm, owner);
+            int64_t v = poly_center(ctx.per_proxy[owner][j].value, P.q)[0];
+            sum0 += (double)v;
+            s0 += (double)v * (double)v;
+            int64_t w = poly_center(poly_sub(rk, ctx.per_proxy[owner][j].value, P.q), P.q)[0];
+            sum2 += (double)w;
+            s2 += (double)w * (double)w;
+        }
+        double m0 = sum0 / zero_trials, m2 = sum2 / zero_trials;
+        double v0 = s0 / zero_trials - m0 * m0, v2 = s2 / zero_trials - m2 * m2;
+        double uni_std = P.q / std::sqrt(12.0);
+        std::printf("  每次试验拿不到的子集数 = %d（应为 1）\n", missing_total / zero_trials);
+        std::printf("  缺失份额第 1 个系数（中心代表）：mean=%.1f, std=%.1f\n", m0, std::sqrt(v0));
+        std::printf("  联盟算出的量 (rk − 缺失份额)     ：mean=%.1f, std=%.1f\n", m2, std::sqrt(v2));
+        std::printf("  均匀分布理论值                    ：mean≈0.0, std≈%.1f (=q/√12)\n", uni_std);
+        std::printf("  ⇒ 统计特征接近均匀 ⇒ t-1 个代理看到的东西与 rk 独立\n");
+    }
+
+    // ---- CSV ----
+    std::string csv = "bench/results/c1_" + P.name + ".csv";
+    std::ofstream f(csv.c_str());
+    if (f) {
+        f << "params,n,t,subsets,succ_t_pct,succ_t_minus_1_pct,noise_ratio,"
+             "share_ms,partials_ms,combine_ms\n";
+        for (std::size_t i = 0; i < csv_rows.size(); ++i) f << csv_rows[i] << "\n";
+        f.close();
+        std::printf("\n结果已写入 %s\n", csv.c_str());
+    } else {
+        std::printf("\n（未能写入 %s：请先创建 bench/results 目录）\n", csv.c_str());
+    }
+    std::printf("================================================================================\n");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 int main(int argc, char** argv) {
+    setup_console_utf8();                       // Windows: 控制台切 UTF-8，避免中文乱码
     std::setvbuf(stdout, nullptr, _IONBF, 0);   // 不缓冲：长实验里日志要实时可见，崩溃时也不丢输出
     if (argc < 2) {
         std::printf("用法:\n"
                     "  ntru_cli selftest\n"
                     "  ntru_cli walkthrough\n"
-                    "  ntru_cli smoke   [EES439|EES1087|EES1171|EES1499] [n_threshold] [t]\n"
+                    "  ntru_cli c1      [参数集] [trials] [zero_trials]   ← C1 门限专项实验\n"
+                    "  ntru_cli smoke   [参数集] [n_threshold] [t]\n"
                     "  ntru_cli vectors <参数集> <seed> [输出文件]\n"
                     "  ntru_cli bench   <参数集> [迭代次数]\n");
         return 2;
@@ -635,6 +827,12 @@ int main(int argc, char** argv) {
     try {
         if (cmd == "selftest") return cmd_selftest();
         if (cmd == "walkthrough") return cmd_walkthrough();
+        if (cmd == "c1") {
+            std::string pn = (argc > 2) ? argv[2] : "EES439";
+            int trials = (argc > 3) ? std::atoi(argv[3]) : 20;
+            int zt = (argc > 4) ? std::atoi(argv[4]) : 1000;
+            return cmd_c1(pn, trials, zt);
+        }
         if (cmd == "smoke") {
             std::string pn = (argc > 2) ? argv[2] : "EES439";
             int nth = (argc > 3) ? std::atoi(argv[3]) : 3;

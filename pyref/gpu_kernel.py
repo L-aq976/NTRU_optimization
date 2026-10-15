@@ -26,9 +26,17 @@ GPU 批量引擎（骨架）
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 
 import numpy as np
+
+# Windows 控制台默认 GBK，脚本输出 UTF-8 会乱码；统一把 stdout/stderr 设为 UTF-8
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 try:
     import cupy as cp
