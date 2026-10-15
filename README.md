@@ -101,11 +101,15 @@ python3 pyref/cross_check.py EES439 7
 python3 pyref/gpu_kernel.py --backend cupy --n 1171 --batch 8192   # 需要 CuPy
 ```
 
-### 已实测的性能基线（本机 Windows/MinGW，**仅作参考**）
+### 已实测的性能基线（本机 i9-14900HX，g++ -O3 -march=native，**仅作参考**）
 | n | poly_mul_ref | poly_mul_fast(int64) | poly_mul_i32(分块) |
 |---|---|---|---|
-| 439 | 560 µs | 91 µs | — |
-| 1171 | 3199 µs | 643 µs | **289 µs** |
+| 439 | 394 µs | 96 µs | 21.5 µs |
+| 1171 | 2831 µs | 543 µs | **148–153 µs** |
+
+> 注：`poly_mul_i32` 每次调用的 3 次 `std::vector` 分配开销实测可忽略
+> （提出分配后 152.5µs vs 148.4µs，属噪声，见 `poly_mul_i32_scratch`）。
+> 旧表里的 289µs 是 MinGW 8.1 的数，本机新编译器快近一倍。
 
 ---
 
@@ -118,9 +122,15 @@ python3 pyref/gpu_kernel.py --backend cupy --n 1171 --batch 8192   # 需要 CuPy
 | `bench/cpu_schoolbook.c` / `cpu_splitloop.c` / `cpu_openmp.c` | **三元** `rand()%3-1` | int32 | 只对三元安全 |
 | `bench/gpu_kernel_v1.py` / `v2.py` / `gpu_transfer.py` | **满量程** `randint(0,2048)` | int64 / int32+归约 | 是 |
 
-结论：**"CPU 59 µs vs GPU 233 µs；批量 104k/s vs 391k/s；GPU 3.7×" 这组数字比较的是两种不同负载**
-（三元乘法的代价远低于满量程 mod q 乘法，而且 `if(!ai) continue` 还跳掉了 1/3 的行）。
-本项目必须用**同分布**重测，把这张表重做一遍——这既是必须做的修正，也是报告里可以写的一条方法学贡献。
+结论：**"CPU 59 µs vs GPU 233 µs、GPU 3.7×" 这组数字比较的是两种不同负载**（三元 vs 满量程），
+而且旧 GPU 基准把 H2D/D2H 搬运也算进了计时区间。**同机同分布（满量程 [0,2048)）重测后，该结论被推翻**：
+
+| n=1171，每次卷积 | CPU `poly_mul_i32` | GPU (C3, kernel-only) | GPU (C3, 端到端) |
+|---|---|---|---|
+| batch=8192 | ~150 µs | **2.03 µs（75×）** | 14.6 µs（10.5×） |
+
+GPU 优势只在批量下成立：batch=1 时 kernel-only 78µs、端到端约 211µs，交叉点约在
+batch≈2–4。完整曲线见 `bench/results/gpu_kernel_sweep_i32twoseg.csv`。
 
 ### 4.2 哪些乘法是满量程的？
 
@@ -156,12 +166,16 @@ python3 pyref/gpu_kernel.py --backend cupy --n 1171 --batch 8192   # 需要 CuPy
    下一步要做"**从 `rk = f_A·f_B^{-1}` 恢复 `f_A`**"（Liu–Pan–Zhang 2019/083 与 2024 版），
    它是"腐化阈值从 1 提到 t"这个主张的量化依据。WSL 里装 fpylll 后可跑大维数 + BKZ。
 3. **C1 的完整论证**：把 `docs/00_design.md` 里"待验证命题"逐条推完（尤其 partial 的 mod p 泄漏）。
-4. **C3**：把 `poly_mul_i32` 的分块归约搬进 CuPy 核（`gpu_kernel.py` 已给骨架），并用**同分布**重测 CPU/GPU。
+4. **[x] C3**：`pyref/gpu_kernel.py` 已重写。实测结论：**不要搬 `poly_mul_i32` 的行式累加器布局**
+   （GPU 上行间需 `__syncthreads()`，反而慢 15%）；**要搬的是"两段拆分去分支"** + int16/int32。
+   分块归约只在换 int32 后才必需（int32 下 `n(q-1)²≈4.9e9 > 2^31` 会静默回绕）。
+   同分布重测完成，最佳核 batch=8192 时 **2.03µs/次（75× vs CPU）**。
 5. **C2 收尾**：① 查清 `docs/C2_实现进度.md` §4.4 记的 **EES1087 与论文 Table 4 不一致**
    （我们算出 δ(21)=56.7%，设计文档认为应约 10%；其余三个参数集都对上了）；
    ② 门限联合表（`--m-list`）跑全；③ `--backend cupy` 在 WSL 里实测，把 MC 样本量提到 1e7+ 让 δ 测到 1e-6。
 6. **参数安全估计**：用 lattice-estimator / BKZ 成本模型把 `(n,q,df,dg)` 换成安全位数（`docs/02_格在哪里.md` §5）。
-7. 每完成一步，把数字写进 `bench/results/*.csv`（**已建**：C2 的三张表在那里）。
+7. **[x]** `bench/results/*.csv` 已建：C2 的三张表 + C3 的 `gpu_kernel_sweep_i32twoseg.csv`、
+   `gpu_kernel_sweep_i64.csv`、`gpu_kernel_variants.csv`（+ `bench/kernel_variants.py` 复现脚本）。
 
 ---
 
