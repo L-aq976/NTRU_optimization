@@ -1,7 +1,7 @@
 # ============================================================================
 #  build.ps1 -- Windows build script (MinGW-w64 g++, no CMake needed)
 #
-#  Usage (inside the 最终方案 folder):
+#  Usage (from the repository root):
 #     powershell -ExecutionPolicy Bypass -File .\build.ps1
 #     powershell -ExecutionPolicy Bypass -File .\build.ps1 -Test
 #     powershell -ExecutionPolicy Bypass -File .\build.ps1 -Smoke

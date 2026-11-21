@@ -1,224 +1,271 @@
-# 最终方案 · 代码骨架
+# 基于格密码的代理重加密算法设计与优化实现（A1-4）
 
-> 赛题 A1-4：**基于格密码的代理重加密算法设计与优化实现**
-> 项目主题：**面向多跳可用性的 NTRU 代理重加密 —— 门限多代理委托、失败概率预算与 GPU 批量实现**
-> 版本：2026-10-15（骨架初版 2026-10-12）
-> 现状：**C1 / C2 / C3 三个创新点均已完成并实测** —— 成果与结论见 **[最终报告.md](最终报告.md)**；
-> 本 README 只负责"怎么跑"与"环境坑"
-
----
-
-## 0. 30 秒看懂这个骨架
-
-已经跑通的东西（在本机 Windows + MinGW-w64 g++ 上实测；**时序数字与机器相关**）：
-
-```
-$ bin/ntru_cli.exe selftest      # 21 项全部通过
-$ bin/ntru_cli.exe walkthrough   # ★ 教学参数(n=7)下的完整流程预演，每一步都打印全部系数
-$ bin/ntru_cli.exe smoke EES439 3 2
-   KeyGen 1.73ms / Enc 0.16ms / Dec 0.16ms / ReKeyGen 0.16ms / ReEnc 0.34ms
-   Enc 噪声 184 / 重加密噪声 499 / 门限(n=3,t=2) 噪声 698（相对基线 ×1.40）
-$ python pyref/cross_check.py EES439 7     # C++ 与 Python 参考实现 9 项代数关系全部一致
-$ python pyref/hop_sim.py --selftest       # ★ C2 数值核心的 7 类硬断言（含与 C++ 引擎逐位对拍）
-$ python pyref/mc_failprob.py              # ★ C2：跑 δ(h) 曲线 + 跳数预算，落三张 CSV
-```
-
-即：**NTRU 五个算法 + 门限分享/部分重加密/组合 + 跨语言一致性校验 + C2 失败概率预算**都已经能跑。
-流程讲解见 **[docs/01_加密流程预演.md](docs/01_加密流程预演.md)**（两个对象走完全程，每个数字都能手工验算）；
-C2 的结论见 **[最终报告.md](最终报告.md) §3**。
+> 2026 第十一届全国密码技术竞赛 · 赛题 A1-4
+> 作品主题：**面向多跳可用性的 NTRU 代理重加密——门限多代理委托、失败概率预算与 GPU 批量实现**
+> 版本：2026-10-18
+> 提交包只包含**源码、测试、实验数据与设计文档**；作品设计报告与审批签字页随平台单独提交。
+> 若在完整仓库中，报告源稿为根目录的 `最终报告.md`。
 
 ---
 
-## 1. 语言选择与理由
+## 0. 作品是什么
 
-| 部分 | 语言 | 为什么 |
-|---|---|---|
-| 核心密码引擎（环运算、NTRU、门限、攻击脚本接口） | **C++17** | ① "优化实现"这一章必须靠它，Python 做不出性能数字；② Windows(MinGW g++) 与 WSL(gcc 13.3) 都能编，本机可即时验证；③ 你已有的 CPU 基准是 C，可以直接接进来对比 |
-| 参考实现 + 跨语言校验 | **Python 3 + NumPy** | 用另一套独立实现验证 C++，比"自己验自己"可信；也方便写报告里的算法伪码对照 |
-| GPU 批量算子 | **Python + CuPy(RawKernel/NVRTC)** | 已验证过：Windows 侧没有 cl.exe，nvcc 编不了；CuPy 走 NVRTC 不需要装 Toolkit，WSL 里 GPU 直通可用 |
-| 蒙特卡洛（噪声/跳数预算） | **Python + CuPy** | 复用已有的 `multihop_failprob_gpu.py`（180k 链·跳/秒） |
+在 **NTRUReEncrypt**（Nuñez–Agudo–Lopez, ASIA CCS 2015）这条“环上 NTRU 代理重加密”路线上，针对原方案的三个工程缺陷做了三项互相咬合的工作：
 
-> 一句话：**C++ 负责"快"和"可交付"，Python 负责"对"和"GPU/模拟"。**
+| 编号 | 工作 | 解决的问题 | 主要落点 |
+|---|---|---|---|
+| **C1** | 门限多代理委托 | `rk = f_A·f_B^{−1}` 是单点信任，1 个代理 + 接收者即可恢复 `f_A` | `src/core/threshold.*`、`ntru_cli c1` |
+| **C2** | 多跳失败概率预算 | 论文只给经验跳数，无法回答“给定失败概率还能跳几次” | `pyref/hop_sim.py`、`pyref/mc_failprob.py` |
+| **C3** | GPU 批量（部分）重加密 | 旧基准把 CPU 三元与 GPU 满量程混比，得出错误的“GPU 3.7×” | `pyref/gpu_kernel.py`、`bench/kernel_variants.py` |
+
+三项工作的关系：**C2 给出“噪声预算 → 可用跳数”的标尺，C1 用它选可用的 `(N,t)` 并付出“噪声 ×m 份”的代价，C3 把 C1 那 `m` 份相互独立的 partial 批量喂给 GPU。**
+
+关键结果（详见 `bench/results/*.csv` 与作品设计报告）：
+
+| 维度 | 结果 |
+|---|---|
+| 门限性 | `t` 个代理转换成功率 **100%**；`t−1` 个代理“尽力而为”组合成功率 **0.00%（21/21 配置）** |
+| 正确性 | `selftest` **21/21**；C++ ↔ Python 逐位对拍 `max\|diff\| = 0` |
+| 多跳预算 | 鞍点模型标定常数 **1.0015–1.0152**，残差 ≤ **0.095 decade**；失败概率可外推到 **2^−40** |
+| 跳数预算 | `EES1499` 在 `δ=2^−40` 下仍可 **10 跳**，`EES1171` 4 跳，`EES1087` 3 跳 |
+| GPU 加速 | `n=1171, batch=8192` 同分布满量程：kernel-only **2.03 µs/次（75.24×）**，端到端 **14.57 µs/次（10.47×）** |
+| 交叉点 | GPU 从 **batch ≈ 2–4** 开始有收益；更小批量走 CPU |
+
+---
+
+## 1. 30 秒跑通
+
+### Windows（MinGW-w64 g++）
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build.ps1 -Test   # 编译 + selftest
+.\bin\ntru_cli.exe selftest                                  # 21/21
+.\bin\ntru_cli.exe walkthrough                               # 教学参数 n=7，逐系数预演
+python pyref\cross_check.py EES439 7                         # C++ ↔ Python 9 项代数关系
+```
+
+### WSL / Linux（正式实验推荐）
+
+```bash
+make            # 生成 bin/ntru_cli 与 bin/ntru_tests
+make test       # 单元测试（tests/test_core.cpp）
+./bin/ntru_cli selftest
+```
+
+`bin/` 是构建产物，不随本包提供；先构建再运行。
 
 ---
 
 ## 2. 目录结构
 
 ```
-最终方案/
-├── README.md                  ← 本文件
-├── Makefile                   ← WSL/Linux 构建（正式实验用这个）
-├── build.ps1                  ← Windows 快速构建（纯 ASCII，避免 GBK 坑）
+.
+├── README.md                  本文件
+├── Makefile                   WSL/Linux 构建
+├── build.ps1                  Windows 快速构建（纯 ASCII，避免 GBK 坑）
 ├── src/
 │   ├── core/
-│   │   ├── params.h/.cpp         参数集（EES1087/1171/1499 + APR2011_439*）+ 自检
-│   │   ├── ring.h/.cpp           Z_q[x]/(x^n-1)：三层乘法（ref / int64 / int32分块）
-│   │   ├── poly_inv.h/.cpp       多项式求逆：GF(2) 扩展欧几里得 + Hensel 提升到 mod 2^16
-│   │   ├── sampler.h/.cpp        三元固定重量采样 / 均匀采样 / 随机源（含 CSPRNG TODO）
-│   │   ├── ntru.h/.cpp           NTRU 基础：KeyGen / Enc / Dec（含噪声度量）
-│   │   ├── pre_base.h/.cpp       基线 NTRUReEncrypt：ReKeyGen / ReEnc
-│   │   └── threshold.h/.cpp      ★ C1：门限分享 / 部分重加密 / 组合
-│   ├── cli/main.cpp              selftest / walkthrough / smoke / vectors / bench
-│   └── tests/                    （见 tests/test_core.cpp，独立的单元测试）
+│   │   ├── params.h/.cpp      参数集（EES439/1087/1171/1499 + TINY7/TINY61）
+│   │   ├── ring.h/.cpp        Z_q[x]/(x^n−1)：ref / int64 / int32 分块三种乘法
+│   │   ├── poly_inv.h/.cpp    GF(2) 扩展欧几里得 + Hensel 提升
+│   │   ├── sampler.h/.cpp     三元固定重量采样（含 CSPRNG TODO）
+│   │   ├── ntru.h/.cpp        KeyGen / Enc / Dec（含噪声度量）
+│   │   ├── pre_base.h/.cpp    基线 NTRUReEncrypt：ReKeyGen / ReEnc
+│   │   └── threshold.h/.cpp   C1：CNF 份额分发 / 部分重加密 / 组合 / 缺口份额
+│   └── cli/main.cpp           selftest / walkthrough / smoke / c1 / vectors / bench
 ├── tests/
-│   ├── test_core.cpp             单元测试（独立于 CLI）
-│   └── fixtures/                 C2 硬断言用的测试向量（bin/ 被 gitignore，所以固化在这里）
+│   ├── test_core.cpp          单元测试（结构测试 + 端到端测试）
+│   └── fixtures/              C2 硬断言使用的固定测试向量
 ├── pyref/
-│   ├── ring_np.py                NumPy 参考：循环卷积 / 中心代表 / 向量解析
-│   ├── ntru_ref_py.py            Python 参考：GF(2) 求逆 + Hensel + 解密
-│   ├── cross_check.py            跨语言一致性校验（9 项代数关系）
-│   ├── attack_lattice.py         ★★ 格攻击：显式构造 Λ_h（2n 维），LLL 恢复私钥
-│   ├── gpu_kernel.py             ★ C3：GPU 批量卷积 + 批量部分重加密（骨架）
-│   ├── hop_sim.py                ★ C2 数值核心：多跳蒙特卡洛 + 鞍点（Lugannani–Rice）尾部模型
-│   └── mc_failprob.py            ★ C2：失败概率预算 / h_max(δ) 反解（已自包含）
+│   ├── ring_np.py             NumPy 参考：循环卷积 / 中心代表
+│   ├── ntru_ref_py.py         Python 参考：求逆 / Hensel / 解密
+│   ├── cross_check.py         C++ ↔ Python 9 项代数关系对拍
+│   ├── attack_lattice.py      显式构造 2n 维格 Λ_h + LLL（TINY7 上恢复私钥）
+│   ├── hop_sim.py             C2 数值核心：MC + 鞍点（Lugannani–Rice）尾部模型
+│   ├── mc_failprob.py         C2 预算层：δ(h) 曲线 / h_max(δ) / 门限代价
+│   └── gpu_kernel.py          C3：CuPy RawKernel 四变体 + NumPy 校验路径
 ├── bench/
-│   ├── kernel_variants.py        C3：四种 GPU 核变体的同条件对比脚本
-│   └── results/                  实测数据（唯一权威来源）
-│       ├── c1_*.csv              C1 门限实验：成功率 / 噪声放大 / 三阶段耗时
-│       ├── c2_*.csv              C2：δ(h) 曲线 / 跳数预算 / 门限代价
-│       └── gpu_kernel_*.csv      C3：kernel-only 与端到端计时
+│   ├── kernel_variants.py     C3：四变体同条件对比
+│   └── results/               全部实验数据（报告数字的唯一出处）
 └── docs/
-    ├── 00_design.md              设计底稿：代码对照表 + 引用列表
-    ├── 01_加密流程预演.md         ★ 两个对象走一遍完整代码（含手工验算示例）
-    ├── 02_格在哪里.md             ★★ 环 vs 格的关系 + 攻击代码逐段讲解（回答"格在哪"）
-    └── 工程复盘.md                ★ 4 个 bug 的复盘、参数核对、与作者实现的差异清单
+    ├── 00_design.md           设计底稿与代码对照
+    ├── 01_加密流程预演.md      两个对象走完整流程，含手工验算
+    ├── 02_格在哪里.md          环与格的关系、攻击代码逐段讲解
+    └── 工程复盘.md             4 个 bug、参数核对、与作者实现的差异
 ```
 
-> **文档入口**：结论看根目录的 **[最终报告.md](最终报告.md)**（C1/C2/C3 全覆盖，含参考文献）；
-> 想手工验算看 `docs/01_加密流程预演.md`；想知道"踩过哪些坑"看 `docs/工程复盘.md`。
-
-★ 标记的文件是创新点落点：C1 = `threshold.*`，C2 = `hop_sim.py` + `mc_failprob.py`，C3 = `gpu_kernel.py`。
-★★ 标记的两个文件回答"**格密码体现在哪**"：算法算环、难度靠格，`attack_lattice.py` 是唯一显式写出格矩阵的地方。
-
-\* 代码里沿用旧名 `EES439`；该组参数来自 ntru 的 **`APR2011_439`**（EES 族**没有** 439）。
-它的字段曾被错读、已于 2026-10-14 修正，复盘见 `docs/工程复盘.md` §6.1(b)。
+> 代码中沿用旧名 `EES439`；该组参数实际来自 **`APR2011_439`**（EES 族没有 439）。
 
 ---
 
 ## 3. 构建与运行
 
-### Windows（快速迭代，本机已可用）
+### 3.1 Windows（MinGW-w64 g++）
+
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\build.ps1 -Test    # 编译 + 自检
-.\bin\ntru_cli.exe smoke EES439 3 2
-python pyref\cross_check.py EES439 7
-python pyref\hop_sim.py --selftest                            # C2 数值核心自检
+powershell -ExecutionPolicy Bypass -File .\build.ps1          # 只编译
+powershell -ExecutionPolicy Bypass -File .\build.ps1 -Test    # 编译 + selftest
+powershell -ExecutionPolicy Bypass -File .\build.ps1 -Smoke   # 编译 + smoke
 ```
 
-### WSL / Linux（正式实验，推荐）
+必须使用 `-static-libstdc++ -static-libgcc`（脚本已加）。Git for Windows 自带的旧 `libstdc++-6.dll` 会排在 PATH 前面，动态链接会让 `vectors` 子命令在构造 `ofstream` 时崩溃。
+
+### 3.2 WSL / Linux
+
 ```bash
-make                 # 编译 bin/ntru_cli 与 bin/ntru_tests（在仓库根目录执行）
-make test            # 单元测试
-make run             # EES439 冒烟
-make bench           # 环乘法微基准
-python3 pyref/cross_check.py EES439 7
-python3 pyref/gpu_kernel.py --backend cupy --n 1171 --batch 8192   # 需要 CuPy
+make            # 编译 CLI 与测试
+make test       # 单元测试
+make selftest   # CLI selftest
+make run        # EES439 冒烟
+make bench      # 环乘法微基准
 ```
 
-### C2：多跳失败概率预算（纯 Python，不需要编译）
+### 3.3 CLI 子命令
+
+```text
+ntru_cli selftest
+ntru_cli walkthrough
+ntru_cli smoke     <参数集> <N> <t>
+ntru_cli c1        <参数集> <trials> <zero_trials>   # C1 门限专项实验
+ntru_cli vectors   <参数集> <seed> [输出文件]
+ntru_cli bench     <参数集> [迭代次数]
+```
+
+---
+
+## 4. 复现实验
+
+### 4.1 C1：正确性、门限性与零信息
+
+```powershell
+.\bin\ntru_cli.exe c1 EES439  20 1000
+.\bin\ntru_cli.exe c1 EES1171 10 500
+.\bin\ntru_cli.exe c1 EES1499 10 500
+```
+
+输出写入 `bench/results/c1_*.csv`。每条记录包含：
+
+- `succ_t_pct`：`t` 个代理一次转换并逐系数还原明文的成功率；
+- `succ_t_minus_1_pct`：`t−1` 个代理“尽力而为”组合后的成功率（应为 0）；
+- `noise_ratio`：门限噪声 / 基线噪声；
+- `share_ms` / `partials_ms` / `combine_ms`：三阶段平均耗时。
+
+`c1` 命令末尾还会跑零信息性检查：联盟 `W={P1,P2}` 缺少的份额数应恒为 1，缺失份额与 `rk − 缺失份额` 的均值/标准差应接近均匀分布（`mean≈0, std≈q/√12`）。
+
+### 4.2 C2：失败概率预算
+
 ```bash
-python pyref/hop_sim.py --selftest                   # 7 类硬断言（含与 C++ 引擎逐位对拍）
-python pyref/mc_failprob.py                          # 4 个参数集：δ(h) 曲线 + 跳数预算 + 三张 CSV
-python pyref/mc_failprob.py --params EES1171 --samples 200000
-python pyref/mc_failprob.py --m-list 1,3,5,10,15     # 门限（C1）代价曲线：m = C(N,t−1)
-python pyref/mc_failprob.py --m-list 1,5,15 --jobs 16  # 并行度（默认 8）
-python pyref/mc_failprob.py --cgf-sweep 50000,200000,800000   # 尾部外推的收敛性检查
+python pyref/hop_sim.py --selftest                          # 7 类硬断言
+python pyref/mc_failprob.py                                 # 4 个参数集，三张 CSV
+python pyref/mc_failprob.py --params EES1499 --samples 30000
+python pyref/mc_failprob.py --m-list 1,3,5,10,15,35,56      # C1 × C2 门限代价
+python pyref/mc_failprob.py --cgf-sweep 50000,200000,800000 # 尾部外推收敛性
 ```
-**调参提示**：`--cgf-samples` **不要往下调**（实测 20 万以上才收敛）；`--samples` 决定 MC 能测到的
-δ 下限（3 万样本约 `3e-5`）；`--jobs` 只在配置之间并行，单个配置内部仍是单线程。
 
-### 已实测的性能基线（本机 Windows/MinGW，**仅作参考**）
-| n | poly_mul_ref | poly_mul_fast(int64) | poly_mul_i32(分块) |
-|---|---|---|---|
-| 439 | 394 µs | 96 µs | 21.5 µs |
-| 1171 | 2831 µs | 543 µs | **148–153 µs** |
+输出：
 
-> 注：`poly_mul_i32` 每次调用的 3 次 `std::vector` 分配开销实测可忽略
-> （提出分配后 152.5µs vs 148.4µs，属噪声，见 `poly_mul_i32_scratch`）。
-> 旧表里的 289µs 是 MinGW 8.1 的数，本机新编译器快近一倍。
+- `bench/results/c2_mc_curve.csv`：`δ(h)` 曲线与 MC 置信区间；
+- `bench/results/c2_budget.csv`：`h_max(δ)`、标定常数、残差/漂移；
+- `bench/results/c2_threshold.csv`：门限配置 `m = C(N,t−1)` 的代价曲线。
 
----
+口径：每条曲线 30000 条链、CGF 样本 20 万、`seed=1`、后端 `fft`（CPU/NumPy）。3 万样本的 MC 实测下限约 `3e−5`，更低概率依赖鞍点外推。
 
-## 4. 两条必须知道的口径问题
+### 4.3 C3：GPU 批量（部分）重加密
 
-### 4.1 你原来的 CPU 与 GPU 基准口径不一致 ⚠️
+需要 CuPy + NVRTC（`nvidia-cuda-nvrtc-cu12 >= 12.8`，否则不认 `compute_120`）：
 
-> 注：下表提到的 `bench/cpu_*.c`、`bench/gpu_kernel_v1.py` 等文件**不在本仓库内**（属于早期的另一份基准代码）。
-> 这里保留结论，是为了说明"重测时口径必须统一"这条方法学要求。
+```bash
+python pyref/gpu_kernel.py --backend cupy --n 1171 --batch 8192 --variant i32twoseg --cpu-us 150.06
+python pyref/gpu_kernel.py --backend cupy --n 1171 --sweep --variant all
+python bench/kernel_variants.py
+```
 
-| 文件 | 系数分布 | 累加类型 | 是否满量程安全 |
-|---|---|---|---|
-| `bench/cpu_schoolbook.c` / `cpu_splitloop.c` / `cpu_openmp.c` | **三元** `rand()%3-1` | int32 | 只对三元安全 |
-| `bench/gpu_kernel_v1.py` / `v2.py` / `gpu_transfer.py` | **满量程** `randint(0,2048)` | int64 / int32+归约 | 是 |
+输出：
 
-结论：**"CPU 59 µs vs GPU 233 µs、GPU 3.7×" 这组数字比较的是两种不同负载**（三元 vs 满量程），
-而且旧 GPU 基准把 H2D/D2H 搬运也算进了计时区间。**同机同分布（满量程 [0,2048)）重测后，该结论被推翻**：
-
-| n=1171，每次卷积 | CPU `poly_mul_i32` | GPU (C3, kernel-only) | GPU (C3, 端到端) |
-|---|---|---|---|
-| batch=8192 | ~150 µs | **2.03 µs（75×）** | 14.6 µs（10.5×） |
-
-GPU 优势只在批量下成立：batch=1 时 kernel-only 78µs、端到端约 211µs，交叉点约在
-batch≈2–4。完整曲线见 `bench/results/gpu_kernel_sweep_i32twoseg.csv`。
-
-### 4.2 哪些乘法是满量程的？
-
-| 算法 | 表达式 | 操作数分布 | int32 累加是否安全 |
-|---|---|---|---|
-| Enc | `h*s` | h 满量程 × s 三元 | 安全（n·(q−1) ≈ 2.4e6） |
-| Dec | `f*c` | f 小（±1,±2,±4）× c 满量程 | 安全（≈ 9.6e6） |
-| ReKeyGen | `f_A*f_B^{-1}` | 小 × 满量程 | 安全 |
-| **ReEnc** | **`C_A*rk`** | **满量程 × 满量程** | **不安全：n·(q−1)² ≈ 4.9e9 > 2^31** |
-
-也就是说：**只有 ReEnc 那条卷积需要"分块归约"**，而它恰好是性能热点。`poly_mul_i32()` 就是为它准备的（int16 系数 + int32 累加 + 每 BLK 项归约，BLK 由 q 反推）。这是 C3 优化的第一个着力点。
+- `bench/results/gpu_kernel_variants.csv`：四变体同条件对比；
+- `bench/results/gpu_kernel_sweep_i32twoseg.csv`：batch 扫描 + 端到端计时；
+- `bench/results/gpu_kernel_sweep_i64.csv`：int64 基线扫描。
 
 ---
 
-## 5. 当前状态与下一步
+## 5. 关键结果与口径
 
-### 已完成（可运行、已验证）
-- [x] 环运算三层实现，`ref == fast == i32` 有测试保证
-- [x] 多项式求逆（mod 2 扩展欧几里得 + Hensel），KeyGen 拒绝采样
-- [x] NTRU Enc/Dec 与基线 ReKeyGen/ReEnc，噪声度量
-- [x] **C1 门限**：CNF/子集加性分享、部分重加密、组合；`(n,t)` 覆盖性与 `t-1` 不可组合性有测试
-- [x] 跨语言（C++ ↔ Python）9 项代数关系一致
-- [x] 测试向量导出（`vectors` 子命令）+ 单元测试 + 冒烟 + 微基准
-- [x] **格在哪里的实证**：`pyref/attack_lattice.py` 显式构造 2n 维格 Λ_h + LLL，
-      在 TINY7 上**精确恢复私钥**（0.29 s）；真实参数给出"LLL 差 2^219 倍"的量化说明（见 `docs/02_格在哪里.md`）
-- [x] **C2 失败概率预算**：`pyref/hop_sim.py` + `pyref/mc_failprob.py` 自包含跑出 δ(h) 曲线，
-      用鞍点（Lugannani–Rice）模型外推到 `2^-40` 并反解 `h_max(δ, 参数, 门限配置)`；
-      门限（C1）的 `m = C(N,t−1)` 耦合已计入，产出"腐化阈值 ↑ → 可用跳数 ↓"代价曲线。
-      噪声核公式已用 C++ 引擎导出的测试向量 **逐位对拍**（`tests/fixtures/`，见 `docs/工程复盘.md` §4）。
-- [x] **C3 GPU 批量卷积**：`pyref/gpu_kernel.py` + `bench/kernel_variants.py`，四种核变体同条件对比，
-      采用 int32 两段拆分版（kernel-only 1.65×、端到端在 batch=8192 时 10.5×）；
-      kernel-only 与端到端**分开报**，见 [最终报告.md](最终报告.md) §4。
+### 5.1 C1 门限性（EES439）
 
-### 下一步
+| 配置 (N,t) | 子集数 m | t 个成功 | t−1 个成功 | 噪声放大 |
+|---|---|---|---|---|
+| (2,2) | 2 | 100% | 0% | 1.424× |
+| (3,2) | 3 | 100% | 0% | 1.643× |
+| (4,2) | 4 | 100% | 0% | 1.855× |
+| (5,2) | 5 | 75% | 0% | 2.190× |
+| (5,3) | 10 | 0% | 0% | 2.256× |
 
-**完整清单见 [最终报告.md](最终报告.md) §8.2。** 几条主要的：
+完整三组参数集见 `bench/results/c1_*.csv`。`t−1` 个代理在全部 21 个配置上成功率恒为 **0.00%**，且缺口份额统计上均匀。
 
-1. **CSPRNG**：把 `Rng` 换成 `getrandom`/`BCryptGenRandom`（`sampler.h` 里有 TODO）。正式密钥生成**不能**用 `mt19937_64`。
-2. **rk 攻击（多密钥格）**：从 `rk = f_A·f_B^{-1}` 恢复 `f_A` —— 这是"腐化阈值从 1 提到 t"这条主张的量化依据。
-3. **C2 的两项收尾**：① `--backend cupy` 把 MC 样本提到 `1e7+`（δ 实测下限 `3e-5 → 1e-6`）；
-   ② EES1087 与论文 Table 4 的**口径差异**（两种口径尚未统一，报告里并列给出、不择一断言）。
-4. **C1 的工程债**：给 `threshold_combine_best_effort` / `threshold_missing_subset` 补单元测试；
-   修 `cmd_c1` 里 `keygen` 失败时未修正分母的统计瑕疵。
-5. **参数安全估计**：用 lattice-estimator / BKZ 成本模型把 `(n,q,df,dg)` 换成安全位数（`docs/02_格在哪里.md` §5）。
+### 5.2 C2 跳数预算
+
+| 参数集 | δ=1e−3 | δ=1e−6 | δ=2^−40 | 标定常数 | 最大残差 |
+|---|---|---|---|---|---|
+| EES1499 | 30 | 19 | 10 | 1.0152 | 0.042 dec |
+| EES1171 | 13 | 8 | 4 | 1.0022 | 0.075 dec |
+| EES1087 | 9 | 5 | 3 | 1.0015 | 0.038 dec |
+| EES439 | 2 | 1 | 0 | 1.0018 | 0.091 dec |
+
+门限代价：在 `δ=1e−3` 下，EES1499 可支撑 `(6,3)`（m=15），EES1171 可支撑 `(5,3)`（m=10）。
+
+### 5.3 C3 性能
+
+`n=1171, q=2048, batch=8192`，输入满量程 `[0,2048)`（与 CPU `poly_mul_i32` 同分布）：
+
+| 变体 | kernel-only | 端到端（含 H2D/D2H） |
+|---|---|---|
+| v1（int64） | 3.50 µs/次（42.8×） | 20.35 µs/次（7.37×） |
+| v4（int32 两段拆分） | **2.03 µs/次（75.24×）** | **14.57 µs/次（10.47×）** |
+
+CPU 对照：`poly_mul_i32 @ n=1171` 在 i9-14900HX + MinGW `g++ -O3 -march=native` 上 **150.06 µs/次**。四变体内部，v4 比 v1 快 **1.65×**（同条件 batch=8192）。
+
+**必须区分的两个口径**：
+
+- **kernel-only**：只计核函数，输入已在 device 上；
+- **端到端**：含 `cp.asarray` / `cp.asnumpy` 搬运。
+
+**必须统一的操作数分布**：只有 ReEnc 的 `C_A·rk` 是满量程 × 满量程（`n(q−1)² ≈ 4.9e9 > 2^31`），必须 int32 分块归约；旧基准拿 CPU 三元 vs GPU 满量程，结论不可比。
 
 ---
 
-## 6. 环境坑（记录一下，省得再踩）
-- **Windows PowerShell 5.1 按 ANSI 读 .ps1**：脚本里别写中文（`build.ps1` 已改成纯 ASCII）。
+## 6. 环境与已知坑
+
+- **Windows PowerShell 5.1 按 ANSI 读 `.ps1`**：`build.ps1` 保持纯 ASCII。
+- **Windows 必须静态链接 libstdc++/libgcc**：否则 `vectors` 子命令会在 `basic_ofstream` 构造函数中崩溃。
 - **Python 读子进程输出**要显式 `encoding="utf-8"`，否则 GBK 解码崩溃（`cross_check.py` 已处理）。
-- **q = 2048 不能做 NTT**：`(Z/2048)^×` 阶为 1024 < n，不存在 n 阶单位根；要 NTT 必须走 CRT + NTT 友好素数。
-- **WSL2 内存约 7.6 GB**：编译/跑大实验时注意内存；GPU 侧 H2D 只有 0.8–2.1 GB/s（端到端吞吐要单独报）。
-- **`-march=native`**：Windows MinGW 8.1 与 WSL gcc 13.3 都支持，但两者的自动向量化质量不同，性能数字必须注明编译器。
-- **⚠️ Windows 上必须加 `-static-libstdc++ -static-libgcc`**（`build.ps1` 已加）。
-  Git for Windows 自带一份**较旧的** `libstdc++-6.dll` 并把它排在 PATH 前面，动态链接的 exe 运行时会绑到**那一份**，
-  与编译时那套 MinGW-w64（g++ 16.2）的头文件 ABI 不一致 → 访问违例。
-  **症状很有迷惑性**：`selftest` / `smoke` / `bench` 全都正常，**只有 `vectors` 段错误** ——
-  因为它是唯一构造 `std::ofstream` 的子命令，崩的位置在 `basic_ofstream` 构造函数里，看起来像源码 bug。
-  排查：`g++ -g -O2 ... && gdb -batch -ex run -ex bt --args ...`；栈里会看到
-  两个 DLL 的来路不同：一个来自 Git for Windows 自带的 MinGW，一个来自独立安装的 MinGW-w64。
+- **`q = 2048` 不能做 NTT**：`(Z/2048)^×` 的阶为 1024 < n，不存在 n 阶单位根。
+- **CUDA**：`nvidia-cuda-nvrtc-cu12 >= 12.8` 才支持 `compute_120`（Blackwell / RTX 50 系）；GPU 计时需注明是否含搬运。
+- **性能数字与机器/编译器相关**：报告中的时序均标注了 CPU/GPU 型号与编译选项。
 
 ---
+
+## 7. 边界与后续
+
+**不主张的内容**（与作品设计报告一致）：
+
+- 不主张 NTRUReEncrypt 本身“安全”：该方案已有反应攻击与 2024 年多项式时间密钥恢复；
+- 不主张“抗合谋”：`t` 个代理合谋仍可重构 `rk`，与接收者联手即得 `f_A`；
+- `partial` 的严格表述是“被新鲜小多项式掩码隐藏”，不是精确的 mod p 投影；
+- 组合者未被门限化，其视野等同基线单代理。
+
+**后续工作**：
+
+1. 把 `sampler.h` 里的 `Rng` 换成 CSPRNG（`getrandom` / `BCryptGenRandom`）；
+2. 补 `rk` 的多密钥格攻击实验，量化“腐化阈值 1→t”；
+3. C2：用 `--backend cupy` 把 MC 样本提到 `1e7+`，把实测下限从 `3e−5` 推到 `1e−6`；
+4. C1：给 `threshold_combine_best_effort` / `threshold_missing_subset` 补单元测试；
+5. 用 lattice-estimator / BKZ 成本模型把 `(n,q,df,dg)` 换算成安全位数。
+
+---
+
+## 8. 数据与文档
+
+- **实验数据**：`bench/results/*.csv`，报告中的每个数字都对应其中一行；时序数字与机器相关。
+- **设计文档**：`docs/01_加密流程预演.md`（可手工验算的完整流程）、`docs/02_格在哪里.md`（环/格关系与攻击代码）、`docs/工程复盘.md`（踩坑记录）。
+- **测试向量**：`tests/fixtures/vectors_EES439_7.txt` 是固定 fixture；`bin/vectors_*.txt` 是运行时生成物，不随包提供。
+- **作品设计报告**：随竞赛平台单独提交；本包不包含报告正文与签字页。

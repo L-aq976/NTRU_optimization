@@ -8,3 +8,8 @@ __pycache__/
 
 # 实验数据（保留 CSV，忽略中间向量文件）
 bin/vectors_*.txt
+
+#报告中间产物
+ppt-figures/
+ppt-figures-v2/
+.ppt*/
