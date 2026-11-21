@@ -362,6 +362,83 @@ static int cmd_vectors(const std::string& pname, uint64_t seed, const std::strin
 // ---------------------------------------------------------------------------
 // bench：环乘法微基准（参考实现 vs 快速实现）
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// 门限份额分发导出（供 C3 的 GPU 批量部分重加密消费真实份额）：
+//   ntru_cli shares <参数集> <seed> <N> <t> [输出文件]
+//
+// 导出 cnf_share 的真实结果 —— 每份 (代理号, 子集掩码, 份额值)，
+// 外加 cA / f_B / m / rk，以及代理 0 的"参考 partial + 它用的噪声 e"，
+// 后者用于 Python/GPU 侧与 C++ 逐位对拍（语义必须完全一致）。
+// ---------------------------------------------------------------------------
+static int cmd_shares(const std::string& pname, uint64_t seed, int nt, int tt,
+                      const std::string& out_path) {
+    const Params& P = param_by_name(pname);
+    if (nt < 1 || tt < 1 || tt > nt) {
+        std::printf("参数非法：要求 1 <= t <= N（收到 N=%d, t=%d）\n", nt, tt);
+        return 2;
+    }
+    Rng rng(seed);
+    KeyPair A, B;
+    if (!keygen(P, rng, A) || !keygen(P, rng, B)) {
+        std::printf("keygen 失败\n");
+        return 1;
+    }
+    Poly m = sample_message(P, rng);
+    Poly s = to_mod_q(sample_fixed_weight(P.n, P.dr, P.dr, rng), P.q);
+    Poly c = poly_add(poly_mul_fast(A.h, s, P.q), to_mod_q(m, P.q), P.q);
+    Poly rk = rekeygen(P, A.f, B.finv);
+
+    ThresholdCtx ctx = cnf_share(P, rk, nt, tt, rng);
+
+    // 参考 partial：代理 0 的每一份份额，连同它实际用的噪声 e 一起导出
+    std::vector<Poly> ref_e, ref_partial;
+    if (!ctx.per_proxy.empty()) {
+        for (const Share& sh : ctx.per_proxy[0]) {
+            Poly e = to_mod_q(sample_fixed_weight(P.n, P.dr, P.dr, rng), P.q);
+            Poly cs = poly_mul_fast(c, sh.value, P.q);
+            Poly pe = poly_mul_const(e, P.p, P.q);
+            ref_e.push_back(e);
+            ref_partial.push_back(poly_add(cs, pe, P.q));
+        }
+    }
+
+    std::ofstream f(out_path.c_str());
+    if (!f) {
+        std::printf("无法写入 %s\n", out_path.c_str());
+        return 1;
+    }
+    f << "PARAMS=" << P.name << "\n";
+    f << "SEED=" << seed << "\n";
+    f << "N=" << P.n << "\n";            // 环维数（与 vectors 同义）
+    f << "Q=" << P.q << "\n";
+    f << "P=" << P.p << "\n";
+    f << "NT=" << nt << "\n";            // 代理数
+    f << "T=" << tt << "\n";             // 门限
+    f << "NSUB=" << ctx.num_subsets() << "\n";
+    f << "CA=" << poly_to_string(c) << "\n";
+    f << "FB=" << poly_to_string(B.f) << "\n";
+    f << "M=" << poly_to_string(m) << "\n";
+    f << "RK=" << poly_to_string(rk) << "\n";
+    for (int i = 0; i < (int)ctx.per_proxy.size(); ++i) {
+        for (const Share& sh : ctx.per_proxy[i]) {
+            f << "SHARE=" << i << "," << sh.subset << "," << poly_to_string(sh.value) << "\n";
+        }
+    }
+    for (std::size_t i = 0; i < ref_partial.size(); ++i) {
+        f << "REFE=" << i << "," << poly_to_string(ref_e[i]) << "\n";
+        f << "REFP=" << i << "," << poly_to_string(ref_partial[i]) << "\n";
+    }
+    f.close();
+
+    std::size_t total = 0;
+    for (const auto& v : ctx.per_proxy) total += v.size();
+    std::printf("已写出 %s\n", out_path.c_str());
+    std::printf("  代理数 N=%d, 门限 t=%d, 子集数 C(N,t-1)=%d, 份额总数=%zu\n",
+                nt, tt, ctx.num_subsets(), total);
+    std::printf("  参考 partial 份数=%zu（代理 0）\n", ref_partial.size());
+    return 0;
+}
+
 static int cmd_bench(const std::string& pname, int iters) {
     const Params& P = param_by_name(pname);
     Rng rng(1);
@@ -835,6 +912,7 @@ int main(int argc, char** argv) {
                     "  ntru_cli c1      [参数集] [trials] [zero_trials]   ← C1 门限专项实验\n"
                     "  ntru_cli smoke   [参数集] [n_threshold] [t]\n"
                     "  ntru_cli vectors <参数集> <seed> [输出文件]\n"
+                    "  ntru_cli shares  <参数集> <seed> <N> <t> [输出文件]   ← 门限份额分发导出（供 GPU 侧消费）\n"
                     "  ntru_cli bench   <参数集> [迭代次数]\n");
         return 2;
     }
@@ -863,6 +941,20 @@ int main(int argc, char** argv) {
             uint64_t seed = (uint64_t)std::strtoull(argv[3], nullptr, 10);
             std::string out = (argc > 4) ? argv[4] : ("vectors_" + pn + "_" + std::string(argv[3]) + ".txt");
             return cmd_vectors(pn, seed, out);
+        }
+        if (cmd == "shares") {
+            if (argc < 6) {
+                std::printf("用法: ntru_cli shares <参数集> <seed> <N> <t> [输出文件]\n");
+                return 2;
+            }
+            std::string pn = argv[2];
+            uint64_t seed = (uint64_t)std::strtoull(argv[3], nullptr, 10);
+            int nt = std::atoi(argv[4]);
+            int tt = std::atoi(argv[5]);
+            std::string out = (argc > 6) ? argv[6]
+                                         : ("shares_" + pn + "_" + argv[3] + "_" +
+                                            std::string(argv[4]) + "_" + std::string(argv[5]) + ".txt");
+            return cmd_shares(pn, seed, nt, tt, out);
         }
         if (cmd == "bench") {
             std::string pn = (argc > 2) ? argv[2] : "EES439";

@@ -279,9 +279,141 @@ class GPUBatchEngine:
         cp.cuda.Stream.null.synchronize()
         return cp.asnumpy(dC).astype(np.int64)
 
+    # ---------------- C3-1：常驻 device buffer ----------------
+    def alloc_persistent(self, batch: int) -> None:
+        """预分配一组常驻 device buffer（同形状的 batch 可反复复用，不再每次 cp.empty）。
+
+        numpy 后端下也分配，保证接口一致（此时就是普通 ndarray）。
+        """
+        self._p_batch = int(batch)
+        xp = cp if self.kernel is not None else np
+        self._p_A = xp.empty((self._p_batch, self.n), dtype=self.in_dtype)
+        self._p_B = xp.empty((self._p_batch, self.n), dtype=self.in_dtype)
+        self._p_C = xp.empty((self._p_batch, self.n), dtype=self.out_dtype)
+
+    def cyc_conv_buffered(self, A: np.ndarray, B: np.ndarray) -> np.ndarray:
+        """用常驻 buffer 做批量循环卷积：只做数据搬运，不重新分配显存。
+
+        与 cyc_conv 的差别正是"分配"这一项 —— 端到端路径里每次 cp.empty 都要
+        走 caching allocator，batch 变化时更明显。
+        """
+        batch = A.shape[0]
+        if getattr(self, "_p_batch", None) != batch:
+            self.alloc_persistent(batch)
+        A = np.asarray(A, dtype=np.int64) % self.q
+        B = np.asarray(B, dtype=np.int64) % self.q
+        if self.kernel is None:
+            np.copyto(self._p_A, A.astype(self.in_dtype))
+            np.copyto(self._p_B, B.astype(self.in_dtype))
+            out = cyclic_conv_ref(A, B, self.q)
+            np.copyto(self._p_C, out.astype(self.out_dtype))
+            return self._p_C.astype(np.int64)
+        self._p_A.set(A.astype(self.in_dtype))     # 写入已有 buffer，不分配
+        self._p_B.set(B.astype(self.in_dtype))
+        self.launch(self._p_A, self._p_B, self._p_C)
+        cp.cuda.Stream.null.synchronize()
+        return cp.asnumpy(self._p_C).astype(np.int64)
+
+    # ---------------- C3-2：多流重叠搬运 ----------------
+    def cyc_conv_pipelined(self, A: np.ndarray, B: np.ndarray,
+                           n_streams: int = 4) -> np.ndarray:
+        """把 batch 切成 n_streams 块，各块在独立非阻塞流上做 H2D → kernel → D2H。
+
+        重叠发生在 GPU 内部：DMA 引擎搬第 k+1 块的同时，SM 在算第 k 块。
+        无 CuPy（或 n_streams<=1）时退化为顺序执行，结果逐位一致。
+        """
+        A = np.asarray(A, dtype=np.int64) % self.q
+        B = np.asarray(B, dtype=np.int64) % self.q
+        batch = A.shape[0]
+        ns = max(1, int(n_streams))
+        if self.kernel is None or ns == 1 or batch < 2:
+            return self.cyc_conv(A, B)
+
+        ns = min(ns, batch)
+        bounds = np.linspace(0, batch, ns + 1).astype(int)
+        streams = [cp.cuda.Stream(non_blocking=True) for _ in range(ns)]
+        hold = [None] * ns
+        for k in range(ns):
+            lo, hi = bounds[k], bounds[k + 1]
+            if hi <= lo:
+                continue
+            st = streams[k]
+            with st:
+                dA = cp.asarray(A[lo:hi].astype(self.in_dtype))
+                dB = cp.asarray(B[lo:hi].astype(self.in_dtype))
+                dC = cp.empty(dA.shape, dtype=self.out_dtype)
+                self.launch(dA, dB, dC)
+                hold[k] = (lo, hi, dC)
+        # 各流内部顺序已排好；统一同步后一次取回，避免把 D2H 串进每块的关键路径
+        for st in streams:
+            st.synchronize()
+        out = np.empty_like(A, dtype=np.int64)
+        for item in hold:
+            if item is None:
+                continue
+            lo, hi, dC = item
+            out[lo:hi] = cp.asnumpy(dC).astype(np.int64)
+        return out
+
+    # ---------------- C3-3：接真实份额分发 ----------------
+    def threshold_partial_reencrypt_shares(self, cA_batch: np.ndarray,
+                                           per_proxy,
+                                           p: int = 3,
+                                           noises=None,
+                                           n_streams: int = 0) -> list:
+        """对**真实份额分发结构**做批量部分重加密。
+
+        per_proxy: list[list[Poly]]，与 C++ ThresholdCtx.per_proxy 同构
+                   （第 i 个代理持有 per_proxy[i] 份份额；份额值是长度 n 的数组）
+        noises:    与 per_proxy 同构的噪声列表；None 表示不加 p*e（仅测卷积）
+
+        把 (代理, 份额) 展开到一个大 batch 上做一次卷积 —— 这正是 GPU 的用法：
+        t 个代理的 m = C(N,t-1) 份部分重加密彼此独立，天然可批量。
+        返回与 per_proxy 同构的 partial 列表。
+        """
+        cA_batch = np.asarray(cA_batch, dtype=np.int64) % self.q
+        Bn = cA_batch.shape[0]
+        flat_share, plan = [], []
+        for i, shares in enumerate(per_proxy):
+            for j, sh in enumerate(shares):
+                flat_share.append(np.asarray(sh, dtype=np.int64) % self.q)
+                plan.append((i, j))
+        if not flat_share:
+            return [[] for _ in per_proxy]
+
+        share_mat = np.stack(flat_share)                      # (S, n)
+        # 每份份额复制 Bn 行，与 cA_batch 对齐；再整体 tile 成 (S*Bn, n)
+        A = np.tile(cA_batch, (len(flat_share), 1))
+        Bm = np.repeat(share_mat, Bn, axis=0)
+        if n_streams and n_streams > 1:
+            prod = self.cyc_conv_pipelined(A, Bm, n_streams=n_streams)
+        else:
+            prod = self.cyc_conv(A, Bm)
+
+        if noises is not None:
+            nz = []
+            for i, shares in enumerate(per_proxy):
+                for j in range(len(shares)):
+                    if i < len(noises) and j < len(noises[i]):
+                        one = np.asarray(noises[i][j], dtype=np.int64) % self.q
+                        nz.append(np.tile(one, (Bn, 1)))
+                    else:
+                        # 该份额没有给噪声：等价于 e = 0（此路径仅用于对拍卷积部分）
+                        nz.append(np.zeros((Bn, self.n), dtype=np.int64))
+            prod = (prod + p * np.stack(nz).reshape(-1, self.n)) % self.q
+
+        out = [[] for _ in per_proxy]
+        for k, (i, j) in enumerate(plan):
+            out[i].append(prod[k * Bn:(k + 1) * Bn] % self.q)
+        return out
+
     def threshold_partial_reencrypt(self, cA_batch: np.ndarray, share: np.ndarray,
                                     p: int = 3, noise=None) -> np.ndarray:
-        """一个代理对一批密文做部分重加密：partial = C_A * share + p * e"""
+        """一个代理对一批密文做部分重加密：partial = C_A * share + p * e
+
+        注意：这是**单份份额**的旧接口；接了真实份额分发之后应改用
+        threshold_partial_reencrypt_shares()（一次吃下全部代理的全部份额）。
+        """
         Bn = cA_batch.shape[0]
         share_b = np.tile(np.asarray(share, dtype=np.int64) % self.q, (Bn, 1))
         prod = self.cyc_conv(cA_batch, share_b)
