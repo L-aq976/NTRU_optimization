@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>C1 页面测试</title>
+<!-- 给了 token，页面就会把它带进 /api/c1/run；mock 后端认这个值 -->
+<meta name="demo-token" content="TESTTOKEN">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 8 8'%3E%3Crect width='8' height='8' fill='%23081E5B'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="../css/app.css">
+<style>
+  #report {
+    position: fixed; right: 12px; top: 12px; z-index: 9999;
+    width: 380px; max-height: 74vh; overflow: auto;
+    background: #081E5B; color: #dbe7ff;
+    font: 11px/1.65 ui-monospace, Consolas, monospace;
+    padding: 10px 12px; border-radius: 10px;
+    box-shadow: 0 18px 40px -20px rgba(0,0,0,.7);
+  }
+  #report b { color: #fff; }
+  #report .ok { color: #7ee2b0; }
+  #report .bad { color: #ff9a8f; }
+  #report .sum { display: block; margin-top: 6px; padding-top: 6px; border-top: 1px solid rgba(255,255,255,.2); }
+</style>
+</head>
+<body>
+<div id="app" class="app"></div>
+<pre id="report">running…</pre>
+
+<script src="../js/data.js"></script>
+<script src="../js/api.js"></script>
+<script src="../js/ui.js"></script>
+<script src="../js/charts.js"></script>
+<script src="../js/ntru.js"></script>
+<script src="../js/threshold.js"></script>
+<script src="../js/page-c1.js"></script>
+<script src="../js/page-live.js"></script>
+<script src="../js/app.js"></script>
+
+<script>
+/* ============================================================================
+ *  浏览器端测试：DOM / 图表 / 交互（真浏览器，真布局）
+ *  用 web/test/mock-server.js 起静态服务，所以 /api/health 这条链路也被测到。
+ * ==========================================================================*/
+(function () {
+  'use strict';
+
+  var lines = [];
+  var pass = 0, fail = 0;
+  var reportEl = document.getElementById('report');
+
+  function paint() {
+    reportEl.innerHTML = lines.join('\n');
+  }
+
+  function ok(name, cond, detail) {
+    if (cond) {
+      pass++;
+      lines.push('<span class="ok">✓ ' + esc(name) + '</span>');
+      console.log('✓ ' + name);
+    } else {
+      fail++;
+      lines.push('<span class="bad">✗ ' + esc(name) + (detail ? '   → ' + esc(detail) : '') + '</span>');
+      console.log('✗ ' + name + (detail ? ' → ' + detail : ''));
+    }
+    paint();
+  }
+
+  function eq(name, a, b) {
+    ok(name, Object.is(a, b) || a === b, Object.is(a, b) || a === b ? '' : '实际 ' + fmt(a) + ' ≠ 期望 ' + fmt(b));
+  }
+
+  function fmt(v) {
+    if (typeof v === 'string') return JSON.stringify(v);
+    if (v && v.length !== undefined) return '[' + Array.prototype.join.call(v, ', ') + ']';
+    return String(v);
+  }
+
+  function esc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  function $(sel, root) { return (root || document).querySelector(sel); }
+  function $$(sel, root) { return Array.prototype.slice.call((root || document).querySelectorAll(sel)); }
+  function text(sel, root) { var n = $(sel, root); return n ? n.textContent.trim() : null; }
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+  function click(sel, root) {
+    var n = $(sel, root);
+    if (!n) throw new Error('click 目标不存在: ' + sel);
+    n.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  }
+
+  function toggle(sel, root) {
+    var n = $(sel, root);
+    if (!n) throw new Error('toggle 目标不存在: ' + sel);
+    n.checked = !n.checked;
+    n.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  async function waitFor(fn, ms) {
+    var t0 = Date.now();
+    while (Date.now() - t0 < (ms || 3000)) {
+      if (fn()) return true;
+      await sleep(40);
+    }
+    return false;
+  }
+
+  function finish() {
+    lines.push('<span class="sum"><b>SUMMARY pass=' + pass + ' fail=' + fail + '</b></span>');
+    lines.push('<span class="sum">' + (fail ? 'RESULT FAIL' : 'RESULT PASS') + '</span>');
+    paint();
+    console.log('SUMMARY pass=' + pass + ' fail=' + fail);
+    console.log(fail ? 'RESULT FAIL' : 'RESULT PASS');
+    document.title = (fail ? 'FAIL ' + fail : 'PASS ' + pass) + ' · C1 页面测试';
+  }
+
+  async function main() {
+    // 默认页现在是 #/live，这一份测的是 C1 数据页 ⇒ 先显式跳过去
+    location.hash = '#/c1';
+    await sleep(120);
+    if (!document.getElementById('c1-root')) {
+      await sleep(300);
+    }
+    await sleep(60);   // 等 app.js 的 boot()（DOMContentLoaded 已触发）
+
+    /* ------------------------------------------------------------ 外壳 ---- */
+    lines.push('<b>外壳与路由</b>');
+    ok('顶栏渲染', !!$('.topbar'));
+    eq('当前页签是 C1 数据', text('.nav__item.is-on .nav__label'), 'C1 数据');
+    eq('导航项只留两页（未实现的里程碑不出现）', $$('.nav__item').length, 2);
+    eq('导航文案', $$('.nav__item .nav__label').map(function (n) { return n.textContent.trim(); }).join('|'),
+      '演示|C1 数据');
+    ok('banner 标题存在', (text('.page-head__title') || '').indexOf('委托凭证') >= 0);
+    ok('跳转锚点 6 个', $$('.jump__link').length === 6);
+    eq('无渲染错误面板内容', ($('#page-errors') || { children: [] }).children.length, 0);
+    ok('tooltip 节点已挂到 body', !!$('.tip'));
+
+    /* ------------------------------------------- 后端探测（走真 HTTP）---- */
+    lines.push('<b>后端探测</b>');
+    await sleep(400);
+    var statusText = text('#status-slot .badge');
+    ok('健康检查走通 → 显示在线', /后端在线/.test(statusText || ''), statusText);
+    ok('在线徽章带 version', /mock/.test(text('#status-slot .badge__text') || ''), statusText);
+
+    /* ---------------------------------------------------------- 顶部 KPI ---- */
+    lines.push('<b>KPI</b>');
+    eq('KPI 卡片 4 个', $$('.kpi').length, 4);
+    var kpi = $$('.kpi__v').map(function (n) { return n.textContent.trim(); });
+    eq('成功率 KPI', kpi[0], '100%');
+    eq('t−1 KPI', kpi[1], '0.00%');
+    eq('噪声区间 KPI', kpi[2], '1.26–4.52×');
+    eq('最大 m KPI', kpi[3], '15 / 15 / 4');
+
+    /* ------------------------------------------------------------ 探针 ---- */
+    lines.push('<b>现场探针</b>');
+    ok('探针卡片存在', !!$('#probe'));
+    eq('参数集按钮 3 个', $$('#probe .seg__btn[data-id]').length, 3);
+    eq('默认选中参数集', text('#probe .seg__btn[data-id].is-on .seg__label'), 'EES1499');
+    eq('配置 chip 7 个', $$('.chip').length, 7);
+    eq('默认配置是 (6,3)', text('.chip.is-on .chip__label'), '(6,3)');
+    eq('W 勾选 6 个', $$('.wchip').length, 6);
+    eq('W 计数文案', text('.wchip-count'), '已选 3 / 3');
+    eq('指标小卡 5 个', $$('.metric').length, 5);
+    eq('子集数指标', text('.metric .metric__v'), '15');
+    eq('耗时指标', $$('.metric')[4].querySelector('.metric__v').textContent.trim(), '58.42 ms');
+    eq('阶段条 3 条', $$('.stage').length, 3);
+    var widths = $$('.stage__fill').map(function (n) { return parseFloat(n.style.width) || 0; });
+    ok('部分重加密占比 > 98%', widths[1] > 98, widths.join('/') + '%');
+    ok('三段宽度合计 ≈ 100%', Math.abs(widths.reduce(function (a, b) { return a + b; }, 0) - 100) < 1.5);
+
+    eq('抽样条 2 行', $$('.trials__row').length, 2);
+    eq('|W|=t 行格子数', $$('.trials__row')[0].querySelectorAll('.tcell').length, 10);
+    eq('|W|=t 全通过', $$('.trials__row')[0].querySelectorAll('.tcell.is-ok').length, 10);
+    eq('|W|=t−1 全失败', $$('.trials__row')[1].querySelectorAll('.tcell.is-fail').length, 10);
+
+    /* -------------------------------------------------------- 子集结构 ---- */
+    lines.push('<b>子集结构图</b>');
+    eq('子集行数 = m', $$('#probe .sg__body .sg').length, 15);
+    eq('表头列存在', $$('#probe .sg--head .sg__p').length, 6);
+    eq('|W|=t 时无缺失行', $$('#probe .sg__body .sg.is-missingrow').length, 0);
+    ok('标题写清 m 与每代理份数',
+      /m = C\(6,2\) = 15/.test(text('.subset__eq')) && /10 份/.test(text('.subset__eq')), text('.subset__eq'));
+    eq('代理持仓 6 格', $$('.holding').length, 6);
+
+    /* ------------------------------------------------------------ 图表 ---- */
+    lines.push('<b>图表</b>');
+    eq('SVG 3 张（成功率/噪声/耗时）', $$('svg').length, 3);
+    eq('成功率柱 21 根', $$('#slot-success svg rect[data-sel]').length, 21);
+    eq('噪声散点 21 个', $$('#slot-noise svg circle').length, 21);
+    eq('耗时堆叠段 63 个', $$('#slot-time svg rect[data-sel]').length, 63);
+    eq('零信息条 3 行', $$('#slot-zero .zrow').length, 3);
+    eq('三张坐标系图都有图例', $$('.legend').length, 3);
+    eq('三张坐标系图都有表格视图', $$('details.details').length, 3);
+
+    /* ------------------------------------------------------------ 表格 ---- */
+    lines.push('<b>录制数据表</b>');
+    eq('表格行数 21', $$('#sec-table tbody tr').length, 21);
+    eq('表头 9 列', $$('#sec-table thead th').length, 9);
+    eq('t−1 列全 0',
+      $$('#sec-table tbody tr').every(function (tr) { return tr.children[4].textContent.trim() === '0.00%'; }), true);
+    eq('默认选中行 1 行', $$('#sec-table tbody tr.is-selected').length, 1);
+
+    /* ------------------------------------------------------------ 交互 ---- */
+    lines.push('<b>交互</b>');
+
+    click('.chip[data-idx="6"]');                       // → (7,4)
+    await sleep(30);
+    eq('切到 (7,4) 后子集数 35', $$('#probe .sg__body .sg').length, 35);
+    eq('切到 (7,4) 后 W 计数', text('.wchip-count'), '已选 4 / 4');
+    eq('切到 (7,4) 后选中行同步', text('#sec-table tbody tr.is-selected td:nth-child(2)'), '(7,4)');
+
+    toggle('.probe__actions .switch:nth-of-type(1) input');   // |W| = t−1
+    await sleep(30);
+    eq('t−1 视图出现 1 个缺失行', $$('#probe .sg__body .sg.is-missingrow').length, 1);
+    ok('缺失行被置顶', $('#probe .sg__body .sg').classList.contains('is-missingrow'));
+    ok('红字提示缺失数', /缺失 1 个子集/.test(text('.subset__miss')), text('.subset__miss'));
+    toggle('.probe__actions .switch:nth-of-type(1) input');
+    await sleep(30);
+    eq('关掉开关后缺失行消失', $$('#probe .sg__body .sg.is-missingrow').length, 0);
+
+    click('.wchip[data-p="5"]');                        // 选 P6
+    await sleep(30);
+    eq('选满后仍等于 t', text('.wchip-count'), '已选 4 / 4');
+    click('.wchip[data-p="6"]');                        // 再选 P7 → 挤掉最早选的 P1
+    await sleep(30);
+    eq('超过 t 自动挤掉最早一个', text('.wchip-count'), '已选 4 / 4');
+    ok('P1 已不在 W 内', !$$('.wchip')[0].classList.contains('is-on'));
+
+    click('#probe .seg__btn[data-id="EES439"]');         // 换参数集
+    await sleep(30);
+    eq('换参数集后配置 chip 数量不变', $$('.chip').length, 7);
+    eq('换参数集后 (7,4) 的 t 成功率 = 0', text('.metrics .metric:nth-child(2) .metric__v'), '0.00%');
+    eq('换参数集后表格仍 21 行', $$('#sec-table tbody tr').length, 21);
+
+    click('#probe .seg__btn[data-id="EES1499"]');
+    click('.chip[data-idx="5"]');                       // 回到 (6,3)
+    await sleep(30);
+
+    /* 运行探针：三阶段动画 → 就绪 */
+    click('button[data-act="run"]');
+    await sleep(40);
+    var runBtn = $('button[data-act="run"]');          // 卡片会被重渲染，必须重新查
+    ok('运行中按钮变灰', runBtn.classList.contains('is-busy'), runBtn.className);
+    eq('运行中按钮文案', runBtn.textContent.trim(), '运行中…');
+    await sleep(200);
+    var midBar = parseFloat(($('[data-runbar]') || { style: {} }).style.width) || 0;
+    ok('运行中进度条在推进', midBar > 0, midBar + '%');
+    var done = await waitFor(function () { return /上次运行/.test(text('.runline__text') || ''); }, 4000);
+    ok('探针跑完写回"上次运行"', done, text('.runline__text'));
+    ok('跑完后按钮恢复可点', !$('button[data-act="run"]').classList.contains('is-busy'));
+
+    /* 点柱子联动 */
+    click('#slot-success svg rect[data-sel="EES1499|(7,4)"]');
+    await sleep(40);
+    eq('点柱子后子集数切到 35', $$('#probe .sg__body .sg').length, 35);
+    eq('点柱子后表格选中 (7,4)', text('#sec-table tbody tr.is-selected td:nth-child(2)'), '(7,4)');
+    eq('点柱子后无渲染错误', ($('#page-errors') || { children: [] }).children.length, 0);
+
+    /* 表格筛选 */
+    click('.table-tools .seg__btn[data-id="EES439"]');
+    await sleep(30);
+    eq('筛选 EES439 → 7 行', $$('#sec-table tbody tr').length, 7);
+    click('.table-tools .seg__btn[data-id="ALL"]');
+    await sleep(30);
+    toggle('.table-tools .switch input');
+    await sleep(30);
+    eq('只看 100% → 15 行', $$('#sec-table tbody tr').length, 15);
+    toggle('.table-tools .switch input');
+    await sleep(30);
+    eq('关掉筛选 → 21 行', $$('#sec-table tbody tr').length, 21);
+
+    /* 点表格行 */
+    click('#sec-table tbody tr:nth-child(1)');
+    await sleep(40);
+    eq('点首行后参数集 = EES439', text('#probe .seg__btn[data-id].is-on .seg__label'), 'EES439');
+    eq('点首行后配置 = (2,2)', text('.chip.is-on .chip__label'), '(2,2)');
+
+    /* ------------------------------------------------------------ 路由 ---- */
+    lines.push('<b>路由</b>');
+    location.hash = '#/c2';
+    await sleep(80);
+    ok('未知 hash 回到演示页（不再有占位页）', !!$('#stage') && !$('.placeholder'));
+    eq('未知 hash 时页签是演示', text('.nav__item.is-on .nav__label'), '演示');
+    location.hash = '#/c1';
+    await sleep(120);
+    ok('切回 C1 重新挂载', !!$('#probe'));
+
+    /* ------------------------------------------------------------ 收尾 ---- */
+    var perr = $('#page-errors');
+    ok('全程无渲染错误面板', !perr || perr.children.length === 0,
+      perr ? perr.innerHTML.slice(0, 300) : '没有 #page-errors 节点');
+
+    finish();
+    window.__NTRU_TEST_DONE__ = true;
+  }
+
+  document.addEventListener('DOMContentLoaded', function () {
+    main().catch(function (err) {
+      lines.push('<span class="bad">测试本身抛异常：' + esc(err && err.message) + '</span>');
+      console.error(err);
+      fail++;
+      finish();
+    });
+  });
+})();
+</script>
+</body>
+</html>

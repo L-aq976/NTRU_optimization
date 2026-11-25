@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>现场演示页测试</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 8 8'%3E%3Crect width='8' height='8' fill='%23081E5B'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="../css/app.css">
+<style>
+  #report {
+    position: fixed; right: 12px; top: 12px; z-index: 9999;
+    width: 380px; max-height: 78vh; overflow: auto;
+    background: #081E5B; color: #dbe7ff;
+    font: 11px/1.65 ui-monospace, Consolas, monospace;
+    padding: 10px 12px; border-radius: 10px;
+    box-shadow: 0 18px 40px -20px rgba(0,0,0,.7);
+  }
+  #report b { color: #fff; }
+  #report .ok { color: #7ee2b0; }
+  #report .bad { color: #ff9a8f; }
+  #report .sum { display: block; margin-top: 6px; padding-top: 6px; border-top: 1px solid rgba(255,255,255,.2); }
+</style>
+</head>
+<body>
+<div id="app" class="app"></div>
+<pre id="report">running…</pre>
+
+<script src="../js/data.js"></script>
+<script src="../js/api.js"></script>
+<script src="../js/ui.js"></script>
+<script src="../js/charts.js"></script>
+<script src="../js/ntru.js"></script>
+<script src="../js/threshold.js"></script>
+<script src="../js/page-c1.js"></script>
+<script src="../js/page-live.js"></script>
+<script src="../js/app.js"></script>
+
+<script>
+/* ============================================================================
+ *  现场演示页测试：真浏览器里把 9→6 跑两遍（大 q 成功 / 小 q 绕回 / 5 个节点失败）
+ * */
+(function () {
+  'use strict';
+  var lines = [], pass = 0, fail = 0;
+  var el = document.getElementById('report');
+
+  function paint() { el.innerHTML = lines.join('\n'); }
+  function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+  function ok(name, cond, detail) {
+    if (cond) { pass++; lines.push('<span class="ok">✓ ' + esc(name) + '</span>'); console.log('✓ ' + name); }
+    else { fail++; lines.push('<span class="bad">✗ ' + esc(name) + (detail ? '   → ' + esc(detail) : '') + '</span>'); console.log('✗ ' + name + (detail ? ' → ' + detail : '')); }
+    paint();
+  }
+  function eq(name, a, b) { ok(name, Object.is(a, b) || a === b, (Object.is(a, b) || a === b) ? '' : '实际 ' + fmt(a) + ' ≠ 期望 ' + fmt(b)); }
+  function fmt(v) { return typeof v === 'string' ? JSON.stringify(v) : String(v); }
+  function $(s, r) { return (r || document).querySelector(s); }
+  function $$(s, r) { return Array.prototype.slice.call((r || document).querySelectorAll(s)); }
+  function text(s, r) { var n = $(s, r); return n ? n.textContent.trim() : null; }
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  function click(sel) {
+    var n = typeof sel === 'string' ? $(sel) : sel;
+    if (!n) throw new Error('找不到：' + sel);
+    n.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  }
+  function waitFor(fn, ms) {
+    var t0 = Date.now();
+    return new Promise(function (resolve) {
+      (function tick() {
+        if (fn()) return resolve(true);
+        if (Date.now() - t0 > (ms || 20000)) return resolve(false);
+        setTimeout(tick, 60);
+      })();
+    });
+  }
+  function finish() {
+    lines.push('<span class="sum"><b>SUMMARY pass=' + pass + ' fail=' + fail + '</b></span>');
+    lines.push('<span class="sum">' + (fail ? 'RESULT FAIL' : 'RESULT PASS') + '</span>');
+    paint();
+    console.log('SUMMARY pass=' + pass + ' fail=' + fail);
+    console.log(fail ? 'RESULT FAIL' : 'RESULT PASS');
+    document.title = (fail ? 'FAIL ' + fail : 'PASS ' + pass) + ' · 现场演示页测试';
+  }
+  function verdictIs(kind) { return ($('#verdict') || {}).className && $('#verdict').className.indexOf('is-' + kind) >= 0; }
+  function runDone() {
+    var v = $('#verdict');
+    if (!v) return false;
+    return /\bis-(ok|bad)\b/.test(v.className);
+  }
+
+  async function main() {
+    await sleep(80);
+
+    /* ---------------------------------------------------------- 初始态 ---- */
+    lines.push('<b>初始状态</b>');
+    eq('默认路由到 #/live', location.hash, '#/live');
+    eq('节点 9 个', $$('.node').length, 9);
+    eq('q 档位 6 个', $$('.qpick__btn').length, 6);
+    eq('默认 q = 2048', text('.qpick__btn.is-on .qpick__val'), '2048');
+    eq('预算显示 q/2', text('#gaugeBudget'), '1024');
+    eq('步骤 8 条', $$('#steps .step').length, 8);
+    eq('d(9,5) 文案在页头', /C\(9,5\)=126/.test(text('.live__lead')) || /C\(9,5\)/.test(text('.live__lead')), true);
+    ok('舞台与检查器存在', !!$('#stage') && !!$('#inspectBody'));
+    eq('导航只留两页（没实现的里程碑不出现）', $$('.nav__item').length, 2);
+    eq('导航文案', $$('.nav__item').map(function (n) { return n.textContent.trim(); }).join('|'), '演示|C1 数据');
+    eq('三个计算域', $$('.domain').length, 3);
+    eq('域标签', $$('.domain__name').map(function (n) { return n.textContent.trim(); }).join('|'), 'A 网关|中立平台|B 网关');
+    eq('两台网关带 GPU 徽章', $$('.domain__gpu').length, 2);
+    eq('每个域的节点数 4 / 1 / 4',
+      $$('.domain').map(function (d) { return d.querySelectorAll('.node').length; }).join(''), '414');
+    ok('暂停/单步初始禁用', $('[data-act="pause"]').disabled && $('[data-act="step"]').disabled);
+
+    /* ------------------------------------------- 大 q：成功跑通 9 → 6 ---- */
+    lines.push('<b>q = 16384：成功路径</b>');
+    click('.speed__btn[data-s="4"]');
+    click('.qpick__btn[data-q="16384"]');
+    eq('切换后预算 8192', text('#gaugeBudget'), '8192');
+
+    click('[data-act="run"]');
+    await sleep(120);
+    ok('运行中按钮置忙', $('[data-act="run"]').classList.contains('is-busy'));
+    ok('运行中暂停可用', !$('[data-act="pause"]').disabled);
+
+    // 立刻暂停：应该停在步骤边界（当前步做完），而不是停在半路
+    click('[data-act="pause"]');
+    await sleep(900);
+    ok('已进入暂停态', /继续/.test(text('[data-act="pause"]')), text('[data-act="pause"]'));
+    ok('暂停提示写了下一步', /下一步：/.test(text('#pauseTag')), text('#pauseTag'));
+    ok('暂停时单步可用', !$('[data-act="step"]').disabled);
+    eq('暂停后还没有结论', verdictIs('run'), true);
+    var doneBefore = $$('.step.is-done').length;
+    ok('暂停落在步骤边界（已完成 1–4 步之一，不是 0）', doneBefore >= 1 && doneBefore <= 4, String(doneBefore));
+
+    // 单步：只放行一个步骤
+    click('[data-act="step"]');
+    await sleep(700);
+    eq('单步只推进一步', $$('.step.is-done').length, doneBefore + 1);
+    ok('单步后仍然暂停', /继续/.test(text('[data-act="pause"]')), text('[data-act="pause"]'));
+
+    click('[data-act="pause"]');   // 继续
+    var done = await waitFor(runDone, 20000);
+    ok('跑到结论', done, text('#verdict'));
+
+    ok('结论是成功', verdictIs('ok'), text('.verdict__title'));
+    ok('结论给出噪声与预算', /噪声 \d+ < q\/2 = 8192/.test(text('.verdict__detail')), text('.verdict__detail'));
+    eq('选中节点 6 个', $$('.node.is-in').length, 6);
+    eq('未参与节点 3 个', $$('.node.is-out').length, 3);
+    eq('完成的节点 6 个', $$('.node.is-done').length, 6);
+    // 回归：新布局 DOM 顺序是 P1–P4, P9, P5–P8，高亮必须按 data-node 落在 P5 上
+    ok('W 含 A 全部 4 个', [0, 1, 2, 3].every(function (i) { return $('.node[data-node="' + i + '"]').classList.contains('is-in'); }));
+    ok('W 含平台 P9', $('.node[data-node="8"]').classList.contains('is-in'));
+    ok('W 含 B 的 P5', $('.node[data-node="4"]').classList.contains('is-in'));
+    ok('W 不含 P6/P7/P8', [5, 6, 7].every(function (i) { return $('.node[data-node="' + i + '"]').classList.contains('is-out'); }));
+    ok('日志写明 W 的组成 = A×4 + 平台×1 + B×1',
+      $$('.logline').some(function (n) { return /A 网关×4 \+ 中立平台×1 \+ B 网关×1/.test(n.textContent); }), '');
+
+    // 按网关批量算：224 + 56 + 56 = 336 次卷积？不——本次只有 126 份被算
+    ok('日志有 A 网关的 batch=224', $$('.logline').some(function (n) {
+      return /A 网关（P1\/P2\/P3\/P4）：batch = 4 代理 × 56 份 = 224 次卷积/.test(n.textContent);
+    }), '');
+    ok('日志有平台的 batch=56', $$('.logline').some(function (n) {
+      return /中立平台（P9）：batch = 1 代理 × 56 份 = 56 次卷积/.test(n.textContent);
+    }), '');
+    ok('密文舞台显示 126 份', /126/.test(text('.core__slot')), text('.core__slot'));
+    ok('日志里有 Σshare = rk 自检', $$('.logline').some(function (n) { return /Σ 全部 126 份份额 = rk：成立/.test(n.textContent); }), '');
+    ok('日志里有 owner 规则', $$('.logline').some(function (n) { return /owner = min\(S∩W\)/.test(n.textContent); }), '');
+    ok('噪声仪表在预算内', /在预算内/.test(text('#gaugeTag')), text('#gaugeTag'));
+    var gv = parseFloat(text('#gaugeVal'));
+    ok('噪声读数在 2000–8192 之间', gv > 2000 && gv < 8192, String(gv));
+
+    /* ------------------------------------------------------- 系数检查器 ---- */
+    lines.push('<b>系数检查器</b>');
+    ok('检查器已有数据（解密噪声条）', $$('#inspectBody rect').length > 400, String($$('#inspectBody rect').length));
+    ok('检查器标注 ‖v‖∞', /‖v‖∞ = \d+/.test(text('.inspect__stats')), text('.inspect__stats'));
+    click('.node[data-node="0"]');
+    await sleep(60);
+    ok('点节点 → 显示该节点的 partial', /partial = C₁·share/.test(text('.inspect__label')), text('.inspect__label'));
+    click('#core');
+    await sleep(60);
+    ok('点密文舞台 → 显示 ct', /组合结果 ct/.test(text('.inspect__label')), text('.inspect__label'));
+    click('#alice');
+    await sleep(60);
+    ok('点 Alice → 显示 f_A', /私钥 f_A/.test(text('.inspect__label')), text('.inspect__label'));
+
+    /* --------------------------------------------------- 对照：只给 5 个 ---- */
+    lines.push('<b>对照：|W| = 5（结构性失败）</b>');
+    ok('成功后有对照按钮', !!$('[data-act="try5"]'));
+    click('[data-act="try5"]');
+    await waitFor(runDone, 20000);
+    ok('结论是失败', verdictIs('bad'), text('.verdict__title'));
+    ok('失败原因是缺份', /结构性/.test(text('.verdict__title')), text('.verdict__title'));
+    ok('说明里写清 |W| < t', /参与集合只有 5 个 < t = 6/.test(text('.verdict__detail')), text('.verdict__detail'));
+    ok('组合只用到 125 份', /125 份/.test(text('.core__slot')), text('.core__slot'));
+    eq('这次只有 5 个节点参与', $$('.node.is-in').length, 5);
+    ok('缺份时仪表标"不适用"', /不适用/.test(text('#gaugeTag')), text('#gaugeTag'));
+
+    /* --------------------------------------------- 小 q：噪声绕回 + 一键 ---- */
+    lines.push('<b>q = 2048：噪声绕回</b>');
+    click('.qpick__btn[data-q="2048"]');
+    click('[data-act="run"]');
+    await waitFor(runDone, 20000);
+    ok('结论是失败', verdictIs('bad'), text('.verdict__title'));
+    ok('失败原因是绕回', /噪声绕回/.test(text('.verdict__title')), text('.verdict__title'));
+    ok('给出量化建议 16384', /16384/.test(text('.verdict__detail')), text('.verdict__detail'));
+    ok('仪表标绕回', /绕回/.test(text('#gaugeTag')), text('#gaugeTag'));
+    ok('有"提到 16384"的按钮', !!$('[data-act="raise"]'));
+
+    click('[data-act="raise"]');
+    await sleep(150);
+    eq('点按钮后 q 切到 16384', text('.qpick__btn.is-on .qpick__val'), '16384');
+    ok('并自动重跑', $('[data-act="run"]').classList.contains('is-busy'));
+    await waitFor(runDone, 20000);
+    ok('重跑成功', verdictIs('ok'), text('.verdict__title'));
+
+    /* ------------------------------------------------------------ 重置 ---- */
+    lines.push('<b>重置与种子</b>');
+    click('[data-act="reset"]');
+    await sleep(120);
+    eq('重置后节点回待命', $$('.node.is-in').length, 0);
+    eq('重置后仪表清零', text('#gaugeVal'), '0');
+    eq('重置后检查器清空', $$('#inspectBody rect').length, 0);
+    ok('重置后按钮可点', !$('[data-act="run"]').classList.contains('is-busy'));
+    ok('重置后暂停/单步回到禁用', $('[data-act="pause"]').disabled && $('[data-act="step"]').disabled);
+    eq('重置后暂停提示清空', text('#pauseTag'), '');
+
+    eq('无渲染错误', (($('#page-errors') || { children: [] }).children || []).length, 0);
+
+    finish();
+    window.__NTRU_TEST_DONE__ = true;
+  }
+
+  document.addEventListener('DOMContentLoaded', function () {
+    main().catch(function (err) {
+      lines.push('<span class="bad">测试本身抛异常：' + esc(err && err.message) + '</span>');
+      console.error(err);
+      fail++;
+      finish();
+    });
+  });
+})();
+</script>
+</body>
+</html>
